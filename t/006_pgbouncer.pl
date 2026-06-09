@@ -70,7 +70,7 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf(
 	'postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
 listen_addresses = '127.0.0.1'
 EOCONF
@@ -82,7 +82,7 @@ $node->append_conf(
 	'pg_hba.conf', "host all all 127.0.0.1/32 trust\n");
 $node->start;
 $node->safe_psql('postgres',
-	'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
+	'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
 # The cluster's superuser is the OS user that ran initdb; capture
 # it so we can connect through pgbouncer as the same role.

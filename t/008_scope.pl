@@ -19,12 +19,12 @@ my $TRACEPARENT = '00-aabbccddeeff00112233445566778899-0011223344556677-01';
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
-	'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
+	'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
 # ----------------------------------------------------------------------
 # Test 1: spans emitted by contrib/otel_postgres_tracing for executor
