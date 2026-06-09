@@ -29,13 +29,15 @@ endif
 
 otel_postgres_tracing = shared_module('otel_postgres_tracing',
   otel_postgres_tracing_sources,
-  c_args: ['-I' + meson.project_source_root() / 'contrib' / 'otel'] + otel_pgt_cppflags,
+  # <otel_api/otel.h> resolves from contrib/otel_api/ in the in-tree
+  # layout via -I.../contrib.
+  c_args: ['-I' + meson.project_source_root() / 'contrib'] + otel_pgt_cppflags,
   kwargs: contrib_mod_args,
 )
 contrib_targets += otel_postgres_tracing
 
 install_data(
   'otel_postgres_tracing.control',
-  'otel_postgres_tracing--1.0.sql',
+  'otel_postgres_tracing--0.1.1.sql',
   kwargs: contrib_data_args,
 )

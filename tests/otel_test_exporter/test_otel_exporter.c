@@ -35,7 +35,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
-#include "../../../../contrib/otel/otel.h"
+#include <otel_api/otel.h>
 
 PG_MODULE_MAGIC;
 

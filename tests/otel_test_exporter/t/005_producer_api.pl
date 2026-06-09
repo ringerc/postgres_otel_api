@@ -36,12 +36,12 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf(
 	'postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
-	'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
+	'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
 # --------------------------------------------------------------------
 # Single psql session: clear, roundtrip, count, pop.  All in one

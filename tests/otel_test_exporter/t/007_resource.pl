@@ -22,12 +22,12 @@ use Test::More;
 	my $node = PostgreSQL::Test::Cluster->new('default');
 	$node->init;
 	$node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 log_min_messages = warning
 EOCONF
 	$node->start;
 	$node->safe_psql('postgres',
-		'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
 	my $out = $node->safe_psql('postgres',
 		'SELECT test_otel_resource_attributes()');
@@ -52,14 +52,14 @@ EOCONF
 	my $node = PostgreSQL::Test::Cluster->new('overridden');
 	$node->init;
 	$node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 otel.service_name = 'orders-db-primary'
 otel.service_instance_id = 'instance-abc-42'
 log_min_messages = warning
 EOCONF
 	$node->start;
 	$node->safe_psql('postgres',
-		'CREATE EXTENSION otel; CREATE EXTENSION test_otel_exporter');
+		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
 	my $out = $node->safe_psql('postgres',
 		'SELECT test_otel_resource_attributes()');

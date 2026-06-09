@@ -35,7 +35,7 @@ $node->init;
 my $span_file = $node->data_dir . '/otel_spans.jsonl';
 
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,otel_demo_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,otel_demo_exporter'
 otel_demo_exporter.output_file = '$span_file'
 log_min_messages = warning
 log_statement = 'none'
@@ -46,7 +46,7 @@ max_worker_processes = 8
 EOCONF
 $node->start;
 $node->safe_psql('postgres',
-	'CREATE EXTENSION otel; CREATE EXTENSION otel_demo_exporter');
+	'CREATE EXTENSION otel_api; CREATE EXTENSION otel_demo_exporter');
 
 if (!$node->raw_connect_works())
 {

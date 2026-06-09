@@ -12,14 +12,14 @@ endif
 
 test_otel_exporter = shared_module('test_otel_exporter',
   test_otel_exporter_sources,
-  c_args: ['-I' + meson.project_source_root() / 'contrib' / 'otel'],
+  c_args: ['-I' + meson.project_source_root() / 'contrib'],
   kwargs: pg_test_mod_args,
 )
 test_install_libs += test_otel_exporter
 
 test_install_data += files(
   'test_otel_exporter.control',
-  'test_otel_exporter--1.0.sql',
+  'test_otel_exporter--0.1.1.sql',
 )
 
 tests += {

@@ -28,7 +28,7 @@ my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-$FLAGS";
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing'
 log_statement = 'all'
 log_min_messages = log
 log_line_prefix = 'TR[%{trace_id}A] SP[%{span_id}A] '
@@ -36,7 +36,7 @@ EOCONF
 $node->start;
 
 # Install the SQL surface (otel_current_traceparent).
-$node->safe_psql('postgres', 'CREATE EXTENSION otel');
+$node->safe_psql('postgres', 'CREATE EXTENSION otel_api');
 
 if (!$node->raw_connect_works())
 {

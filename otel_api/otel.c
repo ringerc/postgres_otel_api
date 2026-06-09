@@ -93,7 +93,7 @@
  * Module must be loaded via shared_preload_libraries so the header
  * handler is registered before any backend processes its first 'M'
  * message, and so the custom GUCs are defined before any worker
- * tries to restore them.  CREATE EXTENSION otel installs the
+ * tries to restore them.  CREATE EXTENSION otel_api installs the
  * introspection SQL function but is not required for receiving
  * trace context from clients.
  *

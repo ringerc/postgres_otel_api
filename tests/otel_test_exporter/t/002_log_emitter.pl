@@ -21,7 +21,7 @@ my $TRACEPARENT = "00-$TRACE_ID-$SPAN_ID-01";
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
 otel.emit_spans_to_log = on
 log_min_messages = warning
 log_statement = 'none'
@@ -33,7 +33,7 @@ if (!$node->raw_connect_works())
 	plan skip_all => "this test requires working raw_connect()";
 }
 
-$node->safe_psql('postgres', 'CREATE EXTENSION otel');
+$node->safe_psql('postgres', 'CREATE EXTENSION otel_api');
 
 # ----- raw-protocol helpers (same shape as 001_basic.pl) -----
 

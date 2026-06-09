@@ -10,10 +10,10 @@ if host_system == 'windows'
     '--FILEDESC', 'otel_demo_exporter - bare-minimum file exporter for contrib/otel spans',])
 endif
 
-# Pick up <otel/otel.h> from contrib/otel for in-tree builds.  An
-# out-of-tree exporter using PGXS gets the same path via the installed
-# server include dir (HEADERS variable in contrib/otel/Makefile + the
-# install_headers call in contrib/otel/meson.build).
+# Pick up <otel_api/otel.h> from contrib/otel_api for in-tree builds.
+# An out-of-tree exporter using PGXS gets the same path via the
+# installed server include dir (HEADERS variable in otel_api/Makefile
+# + the install_headers call in otel_api/meson.build).
 otel_demo_exporter_inc = include_directories('..')
 
 otel_demo_exporter = shared_module('otel_demo_exporter',
@@ -25,7 +25,7 @@ contrib_targets += otel_demo_exporter
 
 install_data(
   'otel_demo_exporter.control',
-  'otel_demo_exporter--1.0.sql',
+  'otel_demo_exporter--0.1.1.sql',
   kwargs: contrib_data_args,
 )
 

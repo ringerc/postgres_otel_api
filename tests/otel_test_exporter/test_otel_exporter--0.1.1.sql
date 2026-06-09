@@ -1,4 +1,4 @@
-/* src/test/modules/otel_test_exporter/test_otel_exporter--1.0.sql */
+/* tests/otel_test_exporter/test_otel_exporter--0.1.1.sql */
 
 \echo Use "CREATE EXTENSION test_otel_exporter" to load this file. \quit
 

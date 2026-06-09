@@ -1,7 +1,7 @@
-/* contrib/otel/otel--1.0.sql */
+/* otel_api--0.1.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION otel" to load this file. \quit
+\echo Use "CREATE EXTENSION otel_api" to load this file. \quit
 
 CREATE FUNCTION otel_current_traceparent()
 RETURNS text
