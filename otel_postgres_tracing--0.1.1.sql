@@ -1,4 +1,4 @@
-/* contrib/otel_postgres_tracing/otel_postgres_tracing--1.0.sql */
+/* otel_postgres_tracing--0.1.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION otel_postgres_tracing" to load this file. \quit

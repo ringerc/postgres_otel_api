@@ -16,7 +16,7 @@
 
 #include "utils/elog.h"
 
-#include "otel.h"
+#include <otel_api/otel.h>
 
 
 /* Cached pointer to the OtelTracingApi rendezvous struct,

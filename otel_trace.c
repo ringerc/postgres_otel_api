@@ -52,7 +52,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
-#include "otel.h"
+#include <otel_api/otel.h>
 #include "otel_postgres_tracing.h"
 
 /*
