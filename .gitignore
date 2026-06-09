@@ -1,0 +1,22 @@
+# Build artefacts
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+.deps/
+tmp_check/
+log/
+
+# PGXS work dirs
+results/
+*.diff
+
+# Editor / IDE
+*~
+.*.swp
+.vscode/
+.idea/
+
+# OS
+.DS_Store
