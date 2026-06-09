@@ -1,4 +1,4 @@
-/* contrib/otel_demo_exporter/otel_demo_exporter--1.0.sql */
+/* otel_demo_exporter--0.1.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION otel_demo_exporter" to load this file. \quit

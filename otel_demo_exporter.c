@@ -42,7 +42,7 @@
 #include "utils/guc.h"
 #include "utils/json.h"
 
-#include <otel/otel.h>
+#include <otel_api/otel.h>
 
 PG_MODULE_MAGIC;
 
