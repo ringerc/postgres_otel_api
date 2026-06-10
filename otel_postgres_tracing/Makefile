@@ -11,6 +11,11 @@ EXTENSION = otel_postgres_tracing
 DATA = otel_postgres_tracing--0.1.1.sql
 PGFILEDESC = "otel_postgres_tracing - OpenTelemetry instrumentation for PostgreSQL query execution"
 
+# No TAP suite lives in this directory --- the tests that exercise
+# otel_postgres_tracing (log annotations, query tracing, sampler
+# policy, sqlcommenter, ...) all live under tests/otel_test_exporter/t/
+# because they need the test-only exporter to observe captured spans.
+# NO_INSTALLCHECK suppresses PGXS's installcheck target outright.
 NO_INSTALLCHECK = 1
 
 # <otel_api/otel.h> resolves from:

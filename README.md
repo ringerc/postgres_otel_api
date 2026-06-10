@@ -12,6 +12,59 @@ OpenTelemetry trace-context plumbing for PostgreSQL, packaged as a
 set of installable extensions. Builds against an unpatched PostgreSQL
 14+ via PGXS, or in-tree as part of a custom postgres source build.
 
+## Why this exists
+
+PostgreSQL has no built-in support for OpenTelemetry trace-context
+propagation, log/trace correlation, or a common API that telemetry
+producers and exporter SDKs can target. Today, every observability
+vendor builds these primitives from scratch, usually with fragile
+workarounds (sqlcommenter parsing, log-line scraping, custom GUCs)
+that don't compose and don't survive prepared statements, parallel
+workers, or proxies. This project proposes a shared scaffold so
+that work can be done once and shared.
+
+The core problem it sets out to solve is **trace-context propagation
+from client to server** that is:
+
+* **Ultra-low-cost** — crucially, zero added round trips per query.
+* **Compatible with the v3 extended protocol** — works with named
+  and anonymous prepared statements, portals, pipelining, etc.
+* **Forward- and backwards-compatible and proxy-safe** — negotiated
+  via the `_pq_.` reserved startup-packet prefix; only activates if
+  the server acknowledges it.
+* **Compatible with client-side statement poolers and caches** —
+  trace context must NOT vary the SQL text or parameter set, or it
+  invalidates the driver's plan cache on every iteration.
+* **Statement-scoped** — a single trace context can be attached to
+  one statement without leaking into the next.
+
+Additional capabilities that need core PostgreSQL support — and are
+addressed by the companion postgres branch listed below — are:
+
+* Automatic trace scoping so spans end when their queries do, even
+  in error and abort paths.
+* Reliably attaching query outcome and causative error to spans
+  without fragile, lossy CONTEXT-string parsing.
+* Trace-context propagation into parallel-query workers, PLs, and
+  background-worker children.
+* Log/trace correlation: trace_id / span_id surfaced as
+  first-class fields in CSV, JSON, and `log_line_prefix` text logs.
+
+The companion PRs against PostgreSQL ([#3][pr3] per-message protocol
+headers, [#4][pr4] `pre_ready_for_query_hook`, [#5][pr5] generic
+elog annotations; [#1][pr1] is the integration umbrella) deliver
+those core pieces; this repo delivers the contrib-side scaffold and
+APIs that consume them. All four extensions also build against
+**unpatched** PostgreSQL 14+ — features are detected at compile
+time and gracefully fall back when absent (the protocol-header fast
+path becomes unavailable, but `SET LOCAL`, session GUCs, and
+sqlcommenter parsing all keep working).
+
+> Arguably the APIs exposed by `otel_api` belong in core. Prototyping
+> them in contrib lets the API surface be exercised and iterated
+> against real exporter SDKs before a core proposal; nothing here
+> precludes a later promotion.
+
 ## What's in here
 
 Four extensions in one repo:
@@ -153,16 +206,21 @@ Suite status:
 
 | Extension | TAP files | In-tree | Out-of-tree (PGXS) |
 |---|---|---|---|
-| `otel_api`               | `t/001_otel.pl`              | yes | yes |
-| `otel_postgres_tracing`  | `t/001_*..008_*.pl` (8 files) | yes | TODO |
-| `otel_demo_exporter`     | `t/001_file_exporter.pl`     | yes | TODO |
-| `tests/otel_test_exporter` | (test harness)             | yes | TODO |
+| `otel_api`                 | `t/001_otel.pl`                | yes | yes |
+| `otel_postgres_tracing`    | (none in this dir)\*           | n/a | n/a |
+| `otel_demo_exporter`       | `t/001_file_exporter.pl`       | yes | yes |
+| `tests/otel_test_exporter` | `t/001_basic.pl` .. `t/008_scope.pl` | yes | partial\*\* |
 
-For the suites marked TODO, the Makefile still has `NO_INSTALLCHECK = 1`
-so `make installcheck` is a no-op. The fix is the same shape that was
-applied to `otel_api/Makefile`: replace `NO_INSTALLCHECK = 1` with
-empty `REGRESS =` and `ISOLATION =` so PGXS skips those runners but
-still drives `prove_installcheck`.
+\* The cross-cutting tests that exercise `otel_postgres_tracing`
+(log annotations, query tracing, sampler policy, sqlcommenter, …) all
+live under `tests/otel_test_exporter/t/` because they need the
+test-only exporter to observe captured spans.
+
+\*\* 6 of 8 TAP files pass cleanly. `002_log_emitter.pl` exits 255
+with no subtests, and `007_resource.pl` fails 2/5 (`service.name` /
+`service.instance.id` GUC overrides) — both look like fallout from the
+recent `otel.*` → `otel_api.*` GUC rename where the tests weren't
+updated. **TODO**: fix these tests so the suite is green out-of-tree.
 
 ### In-tree (subtree-merged into a postgres source tree)
 
