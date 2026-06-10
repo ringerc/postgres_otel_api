@@ -55,13 +55,12 @@ addressed by the companion postgres branch listed below — are:
 
 The companion PRs against PostgreSQL ([#3][pr3] per-message protocol
 headers, [#4][pr4] `pre_ready_for_query_hook`, [#5][pr5] generic
-elog annotations; [#1][pr1] is the integration umbrella) deliver
-those core pieces; this repo delivers the contrib-side scaffold and
-APIs that consume them. All four extensions also build against
-**unpatched** PostgreSQL 14+ — features are detected at compile
-time and gracefully fall back when absent (the protocol-header fast
-path becomes unavailable, but `SET LOCAL`, session GUCs, and
-sqlcommenter parsing all keep working).
+elog annotations) deliver those core pieces; this repo delivers the
+contrib-side scaffold and APIs that consume them. All four extensions
+in this repo also build against **unpatched** PostgreSQL 14+ —
+features are detected at compile time and gracefully fall back when
+absent (the protocol-header fast path becomes unavailable, but
+`SET LOCAL`, session GUCs, and sqlcommenter parsing all keep working).
 
 > Arguably the APIs exposed by `otel_api` belong in core. Prototyping
 > them in contrib lets the API surface be exercised and iterated
