@@ -62,6 +62,30 @@ features are detected at compile time and gracefully fall back when
 absent (the protocol-header fast path becomes unavailable, but
 `SET LOCAL`, session GUCs, and sqlcommenter parsing all keep working).
 
+The expectation is that this scaffold becomes the convergence point
+for OpenTelemetry across the PostgreSQL extension ecosystem:
+
+* **Infrastructure extensions** — foreign data wrappers, table
+  access methods, logical-replication / multi-master systems, and
+  similar — gain end-to-end OpenTelemetry visibility into their
+  activity without shipping their own SDK or exporter. They emit
+  spans through `otel_api`; the operator picks the exporter.
+* **Existing instrumentation extensions** can converge on this API
+  to separate *what* they observe inside PostgreSQL from *where*
+  the telemetry goes, collapsing per-extension exporter wiring
+  into a single shared sink.
+* **New extensions and in-database applications** can use the
+  producer API to instrument their own work and have it land in
+  the same traces as the surrounding query activity.
+* **New exporter extensions** can be written against the exporter
+  API to ship spans (and, in time, metrics and logs) to any
+  backend — Jaeger, Tempo, vendor SaaS, an internal store — without
+  each producer having to learn that target's wire format.
+
+The net effect is one SDK, one resource model, and one
+trace-context-propagation story per cluster — regardless of how many
+tracing-aware extensions are loaded.
+
 > Arguably the APIs exposed by `otel_api` belong in core. Prototyping
 > them in contrib lets the API surface be exercised and iterated
 > against real exporter SDKs before a core proposal; nothing here
