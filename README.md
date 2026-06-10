@@ -17,11 +17,14 @@ set of installable extensions. Builds against an unpatched PostgreSQL
 PostgreSQL has no built-in support for OpenTelemetry trace-context
 propagation, log/trace correlation, or a common API that telemetry
 producers and exporter SDKs can target. Today, every observability
-vendor builds these primitives from scratch, usually with fragile
-workarounds (sqlcommenter parsing, log-line scraping, custom GUCs)
-that don't compose and don't survive prepared statements, parallel
-workers, or proxies. This project proposes a shared scaffold so
-that work can be done once and shared.
+vendor and extension builds these primitives from scratch, usually
+with fragile workarounds (sqlcommenter parsing, log-line scraping,
+custom GUCs) that don't compose and don't survive prepared statements,
+parallel workers, and/or proxies. Extensions may also conflict if
+they both independently embed the same underlying OpenTelemetry SDK,
+especially if different versions are used by each extension. This
+project proposes a shared scaffold so that work can be done once and
+shared.
 
 The core problem it sets out to solve is **trace-context propagation
 from client to server** that is:
