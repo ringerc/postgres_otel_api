@@ -42,12 +42,12 @@ This repo is part of a set:
 | [`ringerc/postgres`][pg] @ `postgres-otel-tracing` | Patched PostgreSQL combining the core changes that unlock Mode 4 trace context propagation ([PR #2][pr2] elog trace-context fields, [PR #3][pr3] protocol headers, [PR #4][pr4] `pre_ready_for_query_hook`, [PR #5][pr5] generic elog annotations) **and** this repo's extensions subtree-merged at `contrib/otel_api`, `contrib/otel_postgres_tracing`, `contrib/otel_demo_exporter`, and `src/test/modules/otel_test_exporter` — so a single `./configure && make install` builds patched server + extensions together as one tree (umbrella [PR #1][pr1], draft). `otel_api` auto-detects PR #2–#5 at compile time and falls back gracefully if absent, so it also builds against stock postgres 14+. |
 | [`ringerc/postgres_otel_tracing_demo`][demo] | A real-`opentelemetry-rust` SDK consumer of `otel_api`'s span-emit hook. Writes spans via OTLP/gRPC. |
 | [`ringerc/postgres_otel_tracing_bench`][bench] | Go benchmark harness measuring trace-context-propagation overhead, including against the M-message mode unlocked by the patched postgres. |
-| [`ringerc/pgx_patches`][pgxp] | pgx (Go driver) fork that adds `'M'` wire support for the patched postgres. |
+| [`ringerc/pgx_patches`][pgxp] @ `m-protocol-headers` | pgx (Go driver) fork that adds `'M'` wire support for the patched postgres. |
 
 [pg]: https://github.com/ringerc/postgres/tree/postgres-otel-tracing
 [demo]: https://github.com/ringerc/postgres_otel_tracing_demo
 [bench]: https://github.com/ringerc/postgres_otel_tracing_bench
-[pgxp]: https://github.com/ringerc/pgx_patches
+[pgxp]: https://github.com/ringerc/pgx_patches/tree/m-protocol-headers
 [pr1]: https://github.com/ringerc/postgres/pull/1
 [pr2]: https://github.com/ringerc/postgres/pull/2
 [pr3]: https://github.com/ringerc/postgres/pull/3
