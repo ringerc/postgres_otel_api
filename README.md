@@ -293,30 +293,21 @@ Fully worked example:
 </details>
 
 <details>
-<summary><b>Inspect or override the active trace context</b> — read
-the propagated traceparent, install a sampler, parse a sqlcommenter
-comment yourself</summary>
+<summary><b>Apply a sqlcommenter comment manually, or install a custom
+sampler</b> — for the niche cases where the automatic propagation
+isn't enough</summary>
 
-Read the client-propagated root context (the trace started by the
-application; what arrived via `'M'` frame, `SET LOCAL`, or
-sqlcommenter):
+You usually don't need either of these. `span_link_to_active_and_push`
+already pulls the parent trace context from the active span stack
+or (if empty) from the propagated client context, so producers
+*just emit spans* and get correct linkage for free. The two
+escape hatches here are for cases where the defaults don't fit.
 
-```c
-OtelRootContextSnapshot root;
-otel_api->get_root_context_snapshot(&root);
-if (root.is_set)
-    elog(DEBUG1, "client trace_id = %s", root.trace_id);
-```
-
-Read the currently-active span on the producer stack (the deepest
-span any producer has pushed):
-
-```c
-const OtelSpanContext *ctx = otel_api->span_current_context();
-```
-
-Try to extract trace context from a SQL comment. Returns true if a
-traceparent was found and applied to the root context:
+**Manually apply a sqlcommenter comment.** `otel_postgres_tracing`
+already calls this from `ExecutorStart` when
+`otel_api.parse_sqlcommenter` is on; an extension only needs to
+invoke it directly if it sees SQL text that bypasses that hook
+(e.g. a custom protocol layer or batched-statement parser):
 
 ```c
 if (otel_api->try_apply_sqlcommenter_context(query_string)) {
@@ -324,9 +315,9 @@ if (otel_api->try_apply_sqlcommenter_context(query_string)) {
 }
 ```
 
-Make a custom sampling decision before letting a span be recorded.
-Hooks are called per `otel_api`'s sampler policy; see the v2.1 API
-docs in [`otel_api/otel_api.h`](otel_api/otel_api.h):
+**Install a custom sampling decision.** Hooks are called per
+`otel_api`'s sampler policy; see the v2.1 API docs in
+[`otel_api/otel_api.h`](otel_api/otel_api.h):
 
 ```c
 static otel_sampler_hook_type prev_sampler;
@@ -345,6 +336,11 @@ void _PG_init(void) {
     otel_api->register_sampler_hook(my_sampler, &prev_sampler);
 }
 ```
+
+If you do need read-only access to the propagated context for some
+other purpose (custom log lines, exporting context to another
+signal type), `otel_api->get_root_context_snapshot()` and
+`otel_api->span_current_context()` are available — see the header.
 
 Fully worked examples:
 
