@@ -324,6 +324,11 @@ attribute storage) lives in [`otel_api/otel.h`](otel_api/otel.h).
 
 ## Installing (out-of-tree, against an existing PostgreSQL)
 
+<details>
+<summary>Clone, <code>make install</code> against your existing
+postgres' <code>pg_config</code>, set <code>shared_preload_libraries</code>,
+<code>CREATE EXTENSION</code>.</summary>
+
 You need PostgreSQL 14+, the `pg_config` binary on your `$PATH` (or
 exported as `PG_CONFIG`), and standard build tools (`gcc`, `make`).
 
@@ -358,7 +363,14 @@ CREATE EXTENSION otel_postgres_tracing;
 CREATE EXTENSION otel_demo_exporter;
 ```
 
+</details>
+
 ## Installing (in-tree, as part of a postgres source build)
+
+<details>
+<summary>Drop the four directories into <code>contrib/</code> +
+<code>src/test/modules/</code> (or subtree-merge), then build postgres
+as usual.</summary>
 
 Copy the four directories into a postgres source tree's `contrib/`
 and `src/test/modules/` respectively (the
@@ -377,6 +389,8 @@ builddir install`). Both the in-tree meson build and the standard
 postgres `make` build pick up the extensions automatically.
 
 [subtree]: #subtree-merging-into-a-postgres-source-tree
+
+</details>
 
 ## Feature detection — patched vs unpatched core
 
@@ -407,6 +421,11 @@ expose overrides — patch the `meson.build` files directly if you
 need to override there.
 
 ## Tests
+
+<details>
+<summary>Suite status table and run instructions (in-tree
+<code>make check-world</code> / <code>meson test</code>, or out-of-tree
+<code>make USE_PGXS=1 installcheck</code>).</summary>
 
 TAP test suites live in `t/` directories alongside each extension.
 Each suite spins up its own temp cluster via `PostgreSQL::Test::Cluster`
@@ -483,7 +502,14 @@ running either suite --- the otel_api TAPs preload both extensions
 to exercise the log-annotation path that lives in
 `otel_postgres_tracing`.
 
+</details>
+
 ## Building from a custom checkout into a postgres tree
+
+<details>
+<summary><code>scripts/refresh-splits.sh</code> produces per-extension
+<code>split/*</code> branches; <code>git subtree add --squash</code>
+them into <code>contrib/</code> and <code>src/test/modules/</code>.</summary>
 
 The `scripts/refresh-splits.sh` helper produces per-extension
 branches (`split/otel_api`, `split/otel_postgres_tracing`,
@@ -509,6 +535,8 @@ git subtree add --prefix=src/test/modules/otel_test_exporter otel_api split/otel
 git subtree pull --prefix=contrib/otel_api otel_api split/otel_api --squash
 # ... and so on for the other three.
 ```
+
+</details>
 
 ## License
 
