@@ -189,8 +189,9 @@ span is silently dropped</summary>
 The default unwind policy is `OTEL_UNWIND_DROP`: `otel_api` registers
 a `MemoryContextCallback` at push time, so the stack entry is popped
 cleanly during ereport unwind and no phantom span is emitted. The
-`OtelSpan` allocation can safely live on the C stack because the
-callback never dereferences it under this policy.
+`OtelSpan` allocation can safely live on the C stack — under DROP
+the stack entry stores NULL for the borrowed pointer, so there is
+structurally no dangling-pointer hazard.
 
 ```c
 #include <otel_api/otel.h>
@@ -247,6 +248,18 @@ unwind because the callback dereferences the borrowed pointer — a
 pure on-stack span is **not** safe under this policy. Use a
 `MemoryContext`-allocated span, a static slab, or another
 unwind-surviving location.
+
+Equally important: `CurrentMemoryContext` at the moment of the
+push *is* the unwind scope. The `MemoryContextResetCallback` is
+registered against it, and that context's reset is what triggers
+the safety net. This is almost always already the right
+per-statement / per-executor context you're in; if you need a
+different scope, `MemoryContextSwitchTo` before pushing (the
+binding is captured at push time; later switches don't move it).
+Pushing under `TopMemoryContext`, `CacheMemoryContext`, or
+`ErrorContext` with `OTEL_UNWIND_ERROR` logs a server-side `LOG`
+message and asserts in cassert builds — those contexts don't reset
+on ereport, so the safety net would never fire.
 
 ```c
 #include <otel_api/otel.h>

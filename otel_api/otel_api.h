@@ -181,12 +181,48 @@ typedef struct OtelTracingApi
 	 * PL handlers, replication apply workers, custom SPI callers
 	 * --- all use the same surface.
 	 *
-	 * Memory model: the consumer owns the OtelSpan allocation (in
-	 * its own MemoryContext, typically palloc'd in a per-statement
-	 * context or kept in a static slab).  The active-span stack
-	 * holds borrowed pointers; the consumer MUST emit before
-	 * destroying the underlying memory.  (Commit C will add a
-	 * MemoryContextCallback safety net for ereport-unwind cases.)
+	 * --------------------------------------------------------------
+	 * Push-time requirements
+	 * --------------------------------------------------------------
+	 *
+	 * The push functions capture two things and remember them
+	 * until span_emit or unwind: the OtelSpan pointer, and the
+	 * active CurrentMemoryContext.
+	 *
+	 * The OtelSpan storage:
+	 *
+	 *   * OTEL_UNWIND_DROP (default): on-stack or anywhere else
+	 *     is fine; the unwind path does not read the span.  The
+	 *     stack entry stores NULL for the span pointer under
+	 *     this policy, so even a stale dangling address is never
+	 *     observed.
+	 *   * OTEL_UNWIND_ERROR: must NOT be on the C stack.  Use a
+	 *     static slab or palloc / malloc.  Storage must stay
+	 *     valid until span_emit returns OR the unwind callback
+	 *     finishes dispatching the span.
+	 *
+	 * The CurrentMemoryContext at push:
+	 *
+	 *   * Defines when the unwind safety net fires --- otel_api
+	 *     registers a MemoryContextResetCallback against the
+	 *     active CurrentMemoryContext at push time, and that
+	 *     context's reset (e.g. on an ereport that unwinds
+	 *     through it) is what triggers OTEL_UNWIND_*.
+	 *   * Typically this is already the right per-statement /
+	 *     per-function context you're in.  If you need a wider
+	 *     or narrower scope, MemoryContextSwitchTo before
+	 *     pushing; the binding is captured at push and later
+	 *     switches don't move it.
+	 *   * Do NOT push under TopMemoryContext, CacheMemoryContext,
+	 *     or ErrorContext: those don't reset on ereport, so under
+	 *     OTEL_UNWIND_ERROR the safety net never fires.  This is
+	 *     enforced with a LOG-level server message at push time;
+	 *     cassert builds Assert() on the misuse.
+	 *
+	 * After span_emit (success path) the storage can be freed and
+	 * the binding is forgotten.  After ereport(ERROR) no cleanup
+	 * is required: the callback pops the stack entry and applies
+	 * the unwind_policy automatically.
 	 *
 	 * Three variants for starting a span:
 	 *
