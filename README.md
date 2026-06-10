@@ -3,10 +3,7 @@
 > [!NOTE]
 > This repository was prepared with significant LLM assistance.
 > Review the code, the wire-protocol claims, and the build paths
-> critically before relying on them. The TAP test suites are inherited
-> verbatim from the postgres source tree they came from and have been
-> exercised there, but the standalone out-of-tree build has not been
-> independently audited.
+> critically before relying on them.
 
 OpenTelemetry trace-context plumbing for PostgreSQL, packaged as a
 set of installable extensions. Builds against an unpatched PostgreSQL
