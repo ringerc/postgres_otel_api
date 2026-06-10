@@ -479,6 +479,45 @@ on_memory_context_reset(void *arg)
  * observable overflow.
  */
 /*
+ * check_unwind_context --- defensive misuse check for push time.
+ *
+ * The push functions register a MemoryContextResetCallback against
+ * the active CurrentMemoryContext.  Under OTEL_UNWIND_ERROR that
+ * callback is the safety net that emits an aborted span on ereport
+ * unwind --- but only if the context actually resets in the normal
+ * course of operation.  TopMemoryContext, CacheMemoryContext, and
+ * ErrorContext don't, so binding the safety net to them silently
+ * defeats it.
+ *
+ * Emit a LOG-level message (server log only --- never delivered to
+ * the client connection, which is the right severity for an API
+ * misuse the SQL caller had no way to cause) and Assert() so cassert
+ * builds crash where the bug is rather than later when the missing
+ * span causes a confusing absence in trace output.
+ *
+ * Only fires under OTEL_UNWIND_ERROR; under OTEL_UNWIND_DROP the
+ * callback isn't load-bearing, so the context choice is harmless.
+ */
+static void
+check_unwind_context(const OtelSpan *span)
+{
+	if (span->unwind_policy != OTEL_UNWIND_ERROR)
+		return;
+
+	if (CurrentMemoryContext == TopMemoryContext ||
+		CurrentMemoryContext == CacheMemoryContext ||
+		CurrentMemoryContext == ErrorContext)
+	{
+		ereport(LOG,
+				(errmsg("otel_api: span pushed under OTEL_UNWIND_ERROR with a long-lived MemoryContext"),
+				 errdetail("CurrentMemoryContext = \"%s\"; the MemoryContextResetCallback that drives the unwind safety net will not fire as expected.",
+						   CurrentMemoryContext->name),
+				 errhint("MemoryContextSwitchTo a per-statement or per-executor context before calling the push function.")));
+		Assert(false);
+	}
+}
+
+/*
  * otel_producer_span_push --- push the span onto the active stack
  * without fetching a parent context.  Used internally by
  * otel_trace.c during Phase 2 migration so the existing
@@ -499,6 +538,8 @@ otel_producer_span_push(OtelSpan *span)
 	if (span == NULL)
 		return;
 
+	check_unwind_context(span);
+
 	if (span_stack_top + 1 < MAX_SPAN_STACK_DEPTH)
 	{
 		OtelSpanStackEntry *entry;
@@ -509,7 +550,14 @@ otel_producer_span_push(OtelSpan *span)
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
-		entry->span = span;
+		/*
+		 * Only OTEL_UNWIND_ERROR ever needs to dereference the
+		 * borrowed pointer at unwind time.  Under OTEL_UNWIND_DROP
+		 * store NULL outright so there is structurally no
+		 * dangling-pointer hazard --- even an on-stack OtelSpan
+		 * cannot become a stale dereference target.
+		 */
+		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
 
 		node = (OtelSpanUnwindNode *) MemoryContextAllocExtended(CurrentMemoryContext,
 																 sizeof(*node),
@@ -541,6 +589,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 {
 	if (span == NULL)
 		return;
+
+	check_unwind_context(span);
 
 	/* Fetch parent: top-of-stack > root context > none. */
 	if (span_stack_top >= 0)
@@ -575,7 +625,8 @@ otel_producer_span_link_to_active_and_push(OtelSpan *span)
 		memcpy(entry->span_id, span->span_id, sizeof(entry->span_id));
 		memcpy(entry->trace_flags, span->trace_flags, sizeof(entry->trace_flags));
 		entry->unwind_policy = span->unwind_policy;
-		entry->span = span;
+		/* DROP entries store NULL --- see otel_producer_span_push. */
+		entry->span = (span->unwind_policy == OTEL_UNWIND_ERROR) ? span : NULL;
 
 		/*
 		 * Register a MemoryContextCallback against CurrentMemoryContext
