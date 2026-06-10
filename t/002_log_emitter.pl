@@ -22,7 +22,7 @@ my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf', <<EOCONF);
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
-otel.emit_spans_to_log = on
+otel_api.emit_spans_to_log = on
 log_min_messages = warning
 log_statement = 'none'
 EOCONF
