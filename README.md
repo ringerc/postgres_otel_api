@@ -133,6 +133,159 @@ This repo is part of a set:
 [pr4]: https://github.com/ringerc/postgres/pull/4
 [pr5]: https://github.com/ringerc/postgres/pull/5
 
+## Using `otel_api` from an extension
+
+Extensions interact with `otel_api` through a single rendezvous-
+discovered struct, [`OtelTracingApi`](otel_api/otel_api.h), populated
+by `otel_api`'s `_PG_init`. Look it up once at your own `_PG_init`,
+verify the version, then call into it through function pointers. The
+typical lookup boilerplate is the same regardless of whether you're
+plugging in an exporter, emitting your own spans, or just reading the
+current trace context — see the in-repo examples below for the full
+shape; the snippets here elide it for brevity.
+
+<details>
+<summary><b>Write a span exporter</b> — register a callback that ships
+emitted spans somewhere</summary>
+
+```c
+#include <otel_api/otel.h>
+
+static otel_span_emit_hook_type prev_hook;
+
+static void
+my_exporter_emit(const OtelSpan *span)
+{
+    /* Serialize and ship: OTLP/gRPC, JSON-lines, vendor SDK, ... */
+    ship_to_backend(span);
+
+    /* Always chain to the previous hook to keep the JSON-log
+     * fallback and any other registered consumer working. */
+    if (prev_hook)
+        prev_hook(span);
+}
+
+void _PG_init(void) {
+    /* ... rendezvous lookup + version check elided ... */
+    api->register_emit_hook(my_exporter_emit, &prev_hook);
+}
+```
+
+Fully worked examples:
+
+* [`otel_demo_exporter/otel_demo_exporter.c`](otel_demo_exporter/otel_demo_exporter.c)
+  — minimal C exporter that writes one JSON line per span.
+* [`postgres_otel_tracing_demo`][demo] — real Rust exporter built on
+  the `opentelemetry-rust` SDK; demonstrates per-backend Tokio
+  runtimes, the OTLP/gRPC exporter, and `BatchSpanProcessor`.
+
+</details>
+
+<details>
+<summary><b>Produce spans from your own extension</b> — instrument
+your work and let whatever exporter is loaded handle delivery</summary>
+
+```c
+#include <otel_api/otel.h>
+
+static const OtelInstrumentationScope *my_scope;
+
+void _PG_init(void) {
+    /* ... rendezvous lookup + version check elided ... */
+    my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+}
+
+void
+do_traced_work(const char *target)
+{
+    OtelSpan span;
+
+    api->span_init(&span, my_scope, "my_extension.do_work",
+                   OTEL_SPAN_KIND_INTERNAL);
+    api->span_link_to_active_and_push(&span);
+    api->span_add_attribute_string(&span, "my.target", target);
+
+    /* ... do the work ... */
+
+    otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
+    otel_span_finalize(&span);
+    api->span_emit(&span);   /* pops the stack + dispatches */
+}
+```
+
+Fully worked examples:
+
+* [`otel_postgres_tracing/otel_trace.c`](otel_postgres_tracing/otel_trace.c)
+  — query-execution instrumentation: spans linked to the propagated
+  client context, attributes for `db.system` / `db.statement` /
+  `db.user`, parallel-worker leader publishing, ERROR-on-unwind.
+* [`tests/otel_test_exporter/test_otel_exporter.c`](tests/otel_test_exporter/test_otel_exporter.c)
+  (`test_otel_producer_roundtrip`) — single-function round trip:
+  `span_init` → push → attrs → status → finalize → `span_emit`.
+
+</details>
+
+<details>
+<summary><b>Inspect or override the active trace context</b> — read
+the propagated traceparent, install a sampler, parse a sqlcommenter
+comment yourself</summary>
+
+```c
+/* Read the client-propagated root context (the trace started by
+ * the application; what arrived via 'M' frame, SET LOCAL, or
+ * sqlcommenter). */
+OtelRootContextSnapshot root;
+api->get_root_context_snapshot(&root);
+if (root.is_set)
+    elog(DEBUG1, "client trace_id = %s", root.trace_id);
+
+/* Read the currently-active span on the producer stack (the deepest
+ * span any producer has pushed). */
+const OtelSpanContext *ctx = api->span_current_context();
+
+/* Try to extract trace context from a SQL comment.  Returns true if
+ * a traceparent was found and applied to the root context. */
+if (api->try_apply_sqlcommenter_context(query_string)) {
+    /* ... a comment-supplied traceparent is now active ... */
+}
+
+/* Make a custom sampling decision before letting a span be recorded.
+ * Hooks are called per contrib/otel's sampler policy; see the v2.1
+ * API docs in otel_api/otel_api.h. */
+static otel_sampler_hook_type prev_sampler;
+static OtelSamplerDecision
+my_sampler(const OtelSamplerInput *in)
+{
+    if (strstr(in->name_hint, "internal."))
+        return OTEL_SAMPLER_DROP;
+    return prev_sampler ? prev_sampler(in)
+                        : OTEL_SAMPLER_RECORD_AND_SAMPLE;
+}
+
+void _PG_init(void) {
+    /* ... rendezvous lookup elided ... */
+    api->register_sampler_hook(my_sampler, &prev_sampler);
+}
+```
+
+Fully worked examples:
+
+* [`tests/otel_test_exporter/test_otel_exporter.c`](tests/otel_test_exporter/test_otel_exporter.c)
+  — exercises the sampler-hook policy matrix (`test_otel_set_policy`)
+  and the resource-attribute introspection used by the TAP suite.
+* [`otel_postgres_tracing/otel_trace.c`](otel_postgres_tracing/otel_trace.c)
+  — calls `try_apply_sqlcommenter_context()` from `ExecutorStart`
+  when `otel_api.parse_sqlcommenter` is on.
+
+</details>
+
+The full API surface — including parallel-worker context publishing,
+resource-attribute introspection, and `OtelInstrumentationScope`
+registration — is documented inline in
+[`otel_api/otel_api.h`](otel_api/otel_api.h). The data model the
+emit-hook receives (`OtelSpan`, `OtelSpanContext`, `OtelEvent`,
+attribute storage) lives in [`otel_api/otel.h`](otel_api/otel.h).
+
 ## Installing (out-of-tree, against an existing PostgreSQL)
 
 You need PostgreSQL 14+, the `pg_config` binary on your `$PATH` (or
