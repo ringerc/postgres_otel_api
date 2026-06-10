@@ -12,7 +12,7 @@ OpenTelemetry trace-context plumbing for PostgreSQL, packaged as a
 set of installable extensions. Builds against an unpatched PostgreSQL
 14+ via PGXS, or in-tree as part of a custom postgres source build.
 
-## Why this exists
+## An integration point and scaffold for OpenTelemetry in PostgreSQL
 
 PostgreSQL has no built-in support for OpenTelemetry trace-context
 propagation, log/trace correlation, or a common API that telemetry
