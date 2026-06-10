@@ -183,7 +183,14 @@ Fully worked examples:
 
 <details>
 <summary><b>Produce spans from your own extension</b> — instrument
-your work and let whatever exporter is loaded handle delivery</summary>
+best-effort sub-spans; if ereport(ERROR) unwinds past span_emit, the
+span is silently dropped</summary>
+
+The default unwind policy is `OTEL_UNWIND_DROP`: `otel_api` registers
+a `MemoryContextCallback` at push time, so the stack entry is popped
+cleanly during ereport unwind and no phantom span is emitted. The
+`OtelSpan` allocation can safely live on the C stack because the
+callback never dereferences it under this policy.
 
 ```c
 #include <otel_api/otel.h>
@@ -198,39 +205,76 @@ void _PG_init(void) {
 void
 do_traced_work(const char *target)
 {
-    /*
-     * Allocate the OtelSpan in a MemoryContext that outlives an
-     * ereport unwind, e.g. a per-statement context or static slab.
-     * A pure on-stack OtelSpan is OK ONLY with the default
-     * OTEL_UNWIND_DROP policy below; OTEL_UNWIND_ERROR needs the
-     * pointer to stay valid during the cleanup callback.
-     */
+    OtelSpan span;
+
+    api->span_init(&span, my_scope, "my_extension.do_work",
+                   OTEL_SPAN_KIND_INTERNAL);
+    api->span_link_to_active_and_push(&span);
+    api->span_add_attribute_string(&span, "my.target", target);
+
+    /* ... do the work; ereport(ERROR) here silently drops the span ... */
+
+    otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
+    otel_span_finalize(&span);
+    api->span_emit(&span);   /* pops the stack + dispatches */
+}
+```
+
+Use this shape for sub-spans inside a larger traced operation where
+losing a span on error is preferable to emitting a half-populated one.
+For statement-level spans where an aborted operation should still
+appear in the trace, see the next entry.
+
+Fully worked example:
+
+* [`tests/otel_test_exporter/test_otel_exporter.c`](tests/otel_test_exporter/test_otel_exporter.c)
+  (`test_otel_producer_roundtrip`) — single-function round trip:
+  `span_init` → push → attrs → status → finalize → `span_emit`.
+
+</details>
+
+<details>
+<summary><b>Produce spans that capture and record errors</b> — opt
+into OTEL_UNWIND_ERROR so an ereport(ERROR) emits the span with
+status=ERROR rather than dropping it</summary>
+
+`OTEL_UNWIND_ERROR` upgrades the safety net: on ereport unwind the
+callback still pops the stack entry, but it also sets the span's
+status to `OTEL_STATUS_ERROR`, fills in `end_time = now` and a
+description from the unwind, and dispatches the span to registered
+exporters. This requires the `OtelSpan` allocation to outlive the
+unwind because the callback dereferences the borrowed pointer — a
+pure on-stack span is **not** safe under this policy. Use a
+`MemoryContext`-allocated span, a static slab, or another
+unwind-surviving location.
+
+```c
+#include <otel_api/otel.h>
+
+static const OtelInstrumentationScope *my_scope;
+
+void _PG_init(void) {
+    /* ... rendezvous lookup + version check elided ... */
+    my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+}
+
+void
+do_traced_work(const char *target)
+{
+    /* Must outlive the unwind: palloc'd here, but a static slab
+     * (cf. otel_postgres_tracing's span_storage) works too. */
     OtelSpan   *span = MemoryContextAlloc(CurrentMemoryContext,
                                           sizeof(OtelSpan));
 
     api->span_init(span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
-
-    /*
-     * Pick what happens if ereport(ERROR) unwinds past span_emit.
-     * otel_api registers a MemoryContextCallback at push time, so
-     * the stack entry is always popped cleanly --- the policy only
-     * decides whether to ALSO emit an ERROR-status span:
-     *
-     *   OTEL_UNWIND_DROP  (default) - silently pop; no phantom span.
-     *   OTEL_UNWIND_ERROR          - pop AND emit with
-     *                                status=ERROR, end_time=now,
-     *                                description from the unwind.
-     *
-     * Use ERROR for statement-level work where an aborted operation
-     * should still show in traces; DROP for best-effort sub-spans.
-     */
     otel_span_set_unwind_policy(span, OTEL_UNWIND_ERROR);
 
     api->span_link_to_active_and_push(span);
     api->span_add_attribute_string(span, "my.target", target);
 
-    /* ... do the work; an ereport(ERROR) here is now safe ... */
+    /* ... do the work; ereport(ERROR) here -> span emitted with
+     *     status=ERROR, end_time=now, descriptive message ... */
 
     otel_span_set_status(span, OTEL_STATUS_OK, NULL);
     otel_span_finalize(span);
@@ -238,15 +282,13 @@ do_traced_work(const char *target)
 }
 ```
 
-Fully worked examples:
+Fully worked example:
 
 * [`otel_postgres_tracing/otel_trace.c`](otel_postgres_tracing/otel_trace.c)
-  — query-execution instrumentation: spans linked to the propagated
-  client context, attributes for `db.system` / `db.statement` /
-  `db.user`, parallel-worker leader publishing, ERROR-on-unwind.
-* [`tests/otel_test_exporter/test_otel_exporter.c`](tests/otel_test_exporter/test_otel_exporter.c)
-  (`test_otel_producer_roundtrip`) — single-function round trip:
-  `span_init` → push → attrs → status → finalize → `span_emit`.
+  — statement-level instrumentation: span_storage is a static slab,
+  `unwind_policy = OTEL_UNWIND_ERROR`, spans linked to the
+  propagated client context, attributes for `db.system` /
+  `db.statement` / `db.user`, parallel-worker leader publishing.
 
 </details>
 
