@@ -17,20 +17,16 @@ NO_INSTALLCHECK = 1
 #   * in-tree: contrib/otel_api/otel.h via -I$(top_srcdir)/contrib
 #   * out-of-tree (PGXS): <pg_config --includedir-server>/extension/otel_api/otel.h
 #
-# Both branches set PG_CPPFLAGS BEFORE include $(PGXS) because pgxs.mk
-# bakes it into the compile rules at include time.
+# All PG_CPPFLAGS additions (-I and -D feature gates) MUST appear BEFORE
+# include $(PGXS) / Makefile.global because pgxs.mk bakes COMPILE.c at
+# include time; later additions to PG_CPPFLAGS never reach the actual
+# compile command line.
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
 PG_CPPFLAGS = -I$(shell $(PG_CONFIG) --includedir-server)/extension
-PGXS := $(shell $(PG_CONFIG) --pgxs)
-include $(PGXS)
 OTEL_PROBE_INC := $(shell $(PG_CONFIG) --includedir-server)
 else
 PG_CPPFLAGS = -I$(top_srcdir)/contrib
-subdir = contrib/otel_postgres_tracing
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
 OTEL_PROBE_INC := $(top_srcdir)/src/include
 endif
 
@@ -45,4 +41,14 @@ ifeq ($(origin ENABLE_ERRANNOT),undefined)
 endif
 ifeq ($(ENABLE_ERRANNOT),1)
   PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
+endif
+
+ifdef USE_PGXS
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
+subdir = contrib/otel_postgres_tracing
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
 endif
