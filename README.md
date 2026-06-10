@@ -198,18 +198,43 @@ void _PG_init(void) {
 void
 do_traced_work(const char *target)
 {
-    OtelSpan span;
+    /*
+     * Allocate the OtelSpan in a MemoryContext that outlives an
+     * ereport unwind, e.g. a per-statement context or static slab.
+     * A pure on-stack OtelSpan is OK ONLY with the default
+     * OTEL_UNWIND_DROP policy below; OTEL_UNWIND_ERROR needs the
+     * pointer to stay valid during the cleanup callback.
+     */
+    OtelSpan   *span = MemoryContextAlloc(CurrentMemoryContext,
+                                          sizeof(OtelSpan));
 
-    api->span_init(&span, my_scope, "my_extension.do_work",
+    api->span_init(span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
-    api->span_link_to_active_and_push(&span);
-    api->span_add_attribute_string(&span, "my.target", target);
 
-    /* ... do the work ... */
+    /*
+     * Pick what happens if ereport(ERROR) unwinds past span_emit.
+     * otel_api registers a MemoryContextCallback at push time, so
+     * the stack entry is always popped cleanly --- the policy only
+     * decides whether to ALSO emit an ERROR-status span:
+     *
+     *   OTEL_UNWIND_DROP  (default) - silently pop; no phantom span.
+     *   OTEL_UNWIND_ERROR          - pop AND emit with
+     *                                status=ERROR, end_time=now,
+     *                                description from the unwind.
+     *
+     * Use ERROR for statement-level work where an aborted operation
+     * should still show in traces; DROP for best-effort sub-spans.
+     */
+    otel_span_set_unwind_policy(span, OTEL_UNWIND_ERROR);
 
-    otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
-    otel_span_finalize(&span);
-    api->span_emit(&span);   /* pops the stack + dispatches */
+    api->span_link_to_active_and_push(span);
+    api->span_add_attribute_string(span, "my.target", target);
+
+    /* ... do the work; an ereport(ERROR) here is now safe ... */
+
+    otel_span_set_status(span, OTEL_STATUS_OK, NULL);
+    otel_span_finalize(span);
+    api->span_emit(span);   /* pops the stack + dispatches */
 }
 ```
 
