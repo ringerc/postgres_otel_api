@@ -209,18 +209,12 @@ Suite status:
 | `otel_api`                 | `t/001_otel.pl`                | yes | yes |
 | `otel_postgres_tracing`    | (none in this dir)\*           | n/a | n/a |
 | `otel_demo_exporter`       | `t/001_file_exporter.pl`       | yes | yes |
-| `tests/otel_test_exporter` | `t/001_basic.pl` .. `t/008_scope.pl` | yes | partial\*\* |
+| `tests/otel_test_exporter` | `t/001_basic.pl` .. `t/008_scope.pl` | yes | yes |
 
 \* The cross-cutting tests that exercise `otel_postgres_tracing`
 (log annotations, query tracing, sampler policy, sqlcommenter, …) all
 live under `tests/otel_test_exporter/t/` because they need the
 test-only exporter to observe captured spans.
-
-\*\* 6 of 8 TAP files pass cleanly. `002_log_emitter.pl` exits 255
-with no subtests, and `007_resource.pl` fails 2/5 (`service.name` /
-`service.instance.id` GUC overrides) — both look like fallout from the
-recent `otel.*` → `otel_api.*` GUC rename where the tests weren't
-updated. **TODO**: fix these tests so the suite is green out-of-tree.
 
 ### In-tree (subtree-merged into a postgres source tree)
 
