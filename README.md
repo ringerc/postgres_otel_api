@@ -26,6 +26,9 @@ especially if different versions are used by each extension. This
 project proposes a shared scaffold so that work can be done once and
 shared.
 
+> Just want to see what calling the API looks like? Skip ahead to
+> [Using `otel_api` from an extension](#using-otel_api-from-an-extension).
+
 The core problem it sets out to solve is **trace-context propagation
 from client to server** that is:
 
