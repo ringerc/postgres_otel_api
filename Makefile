@@ -16,23 +16,21 @@ PGFILEDESC = "otel_api - OpenTelemetry trace-context API for extensions"
 
 TAP_TESTS = 1
 
-# CREATE EXTENSION exposes one introspection function, but the module's
-# trace-context handler is registered from _PG_init() and therefore only
-# functions when otel_api is loaded via shared_preload_libraries.  The TAP
-# test takes care of that; a plain installcheck would have neither the
-# preload nor the protocol-level client and is therefore disabled.
-NO_INSTALLCHECK = 1
+# Empty REGRESS/ISOLATION lists so PGXS's installcheck target is a
+# no-op for the SQL-regression and isolation runners (neither could
+# work anyway: this module's behaviour requires shared_preload_libraries,
+# which a plain pg_regress installcheck can't reconfigure).  Leaving
+# NO_INSTALLCHECK unset means PGXS still invokes prove_installcheck
+# for the TAP suite under t/, which spins up its own temp clusters via
+# PostgreSQL::Test::Cluster and configures shared_preload_libraries
+# per-test.
+REGRESS =
+ISOLATION =
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
-PGXS := $(shell $(PG_CONFIG) --pgxs)
-include $(PGXS)
 OTEL_PROBE_INC := $(shell $(PG_CONFIG) --includedir-server)
 else
-subdir = contrib/otel_api
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
 OTEL_PROBE_INC := $(top_srcdir)/src/include
 endif
 
@@ -56,6 +54,12 @@ endif
 #
 #   make USE_PGXS=1 ENABLE_PROTOCOL_HEADERS=0   # force-disable
 #   make USE_PGXS=1 ENABLE_ERRANNOT=1           # force-enable
+#
+# NB: this block MUST appear BEFORE the PGXS include / Makefile.global
+# include below.  PGXS evaluates COMPILE.c immediately when it pulls in
+# Makefile.global, baking in the current value of PG_CPPFLAGS; any
+# additions made after the include are silently lost from the actual
+# compile command line.
 ifeq ($(origin ENABLE_PROTOCOL_HEADERS),undefined)
   ifneq (,$(wildcard $(OTEL_PROBE_INC)/libpq/protocol_headers.h))
     ENABLE_PROTOCOL_HEADERS = 1
@@ -76,4 +80,14 @@ ifeq ($(origin ENABLE_ERRANNOT),undefined)
 endif
 ifeq ($(ENABLE_ERRANNOT),1)
   PG_CPPFLAGS += -DOTEL_HAVE_ERRANNOT
+endif
+
+ifdef USE_PGXS
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
+subdir = contrib/otel_api
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
 endif
