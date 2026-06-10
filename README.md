@@ -167,7 +167,7 @@ my_exporter_emit(const OtelSpan *span)
 
 void _PG_init(void) {
     /* ... rendezvous lookup + version check elided ... */
-    api->register_emit_hook(my_exporter_emit, &prev_hook);
+    otel_api->register_emit_hook(my_exporter_emit, &prev_hook);
 }
 ```
 
@@ -199,7 +199,7 @@ static const OtelInstrumentationScope *my_scope;
 
 void _PG_init(void) {
     /* ... rendezvous lookup + version check elided ... */
-    my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+    my_scope = otel_api->tracer_register("my_extension", MY_VERSION, NULL);
 }
 
 void
@@ -207,16 +207,16 @@ do_traced_work(const char *target)
 {
     OtelSpan span;
 
-    api->span_init(&span, my_scope, "my_extension.do_work",
+    otel_api->span_init(&span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
-    api->span_link_to_active_and_push(&span);
-    api->span_add_attribute_string(&span, "my.target", target);
+    otel_api->span_link_to_active_and_push(&span);
+    otel_api->span_add_attribute_string(&span, "my.target", target);
 
     /* ... do the work; ereport(ERROR) here silently drops the span ... */
 
     otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
     otel_span_finalize(&span);
-    api->span_emit(&span);   /* pops the stack + dispatches */
+    otel_api->span_emit(&span);   /* pops the stack + dispatches */
 }
 ```
 
@@ -255,7 +255,7 @@ static const OtelInstrumentationScope *my_scope;
 
 void _PG_init(void) {
     /* ... rendezvous lookup + version check elided ... */
-    my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+    my_scope = otel_api->tracer_register("my_extension", MY_VERSION, NULL);
 }
 
 void
@@ -266,19 +266,19 @@ do_traced_work(const char *target)
     OtelSpan   *span = MemoryContextAlloc(CurrentMemoryContext,
                                           sizeof(OtelSpan));
 
-    api->span_init(span, my_scope, "my_extension.do_work",
+    otel_api->span_init(span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
     otel_span_set_unwind_policy(span, OTEL_UNWIND_ERROR);
 
-    api->span_link_to_active_and_push(span);
-    api->span_add_attribute_string(span, "my.target", target);
+    otel_api->span_link_to_active_and_push(span);
+    otel_api->span_add_attribute_string(span, "my.target", target);
 
     /* ... do the work; ereport(ERROR) here -> span emitted with
      *     status=ERROR, end_time=now, descriptive message ... */
 
     otel_span_set_status(span, OTEL_STATUS_OK, NULL);
     otel_span_finalize(span);
-    api->span_emit(span);   /* pops the stack + dispatches */
+    otel_api->span_emit(span);   /* pops the stack + dispatches */
 }
 ```
 
@@ -303,7 +303,7 @@ sqlcommenter):
 
 ```c
 OtelRootContextSnapshot root;
-api->get_root_context_snapshot(&root);
+otel_api->get_root_context_snapshot(&root);
 if (root.is_set)
     elog(DEBUG1, "client trace_id = %s", root.trace_id);
 ```
@@ -312,14 +312,14 @@ Read the currently-active span on the producer stack (the deepest
 span any producer has pushed):
 
 ```c
-const OtelSpanContext *ctx = api->span_current_context();
+const OtelSpanContext *ctx = otel_api->span_current_context();
 ```
 
 Try to extract trace context from a SQL comment. Returns true if a
 traceparent was found and applied to the root context:
 
 ```c
-if (api->try_apply_sqlcommenter_context(query_string)) {
+if (otel_api->try_apply_sqlcommenter_context(query_string)) {
     /* ... a comment-supplied traceparent is now active ... */
 }
 ```
@@ -342,7 +342,7 @@ my_sampler(const OtelSamplerInput *in)
 
 void _PG_init(void) {
     /* ... rendezvous lookup elided ... */
-    api->register_sampler_hook(my_sampler, &prev_sampler);
+    otel_api->register_sampler_hook(my_sampler, &prev_sampler);
 }
 ```
 
