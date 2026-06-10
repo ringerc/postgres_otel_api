@@ -258,29 +258,40 @@ Fully worked examples:
 the propagated traceparent, install a sampler, parse a sqlcommenter
 comment yourself</summary>
 
+Read the client-propagated root context (the trace started by the
+application; what arrived via `'M'` frame, `SET LOCAL`, or
+sqlcommenter):
+
 ```c
-/* Read the client-propagated root context (the trace started by
- * the application; what arrived via 'M' frame, SET LOCAL, or
- * sqlcommenter). */
 OtelRootContextSnapshot root;
 api->get_root_context_snapshot(&root);
 if (root.is_set)
     elog(DEBUG1, "client trace_id = %s", root.trace_id);
+```
 
-/* Read the currently-active span on the producer stack (the deepest
- * span any producer has pushed). */
+Read the currently-active span on the producer stack (the deepest
+span any producer has pushed):
+
+```c
 const OtelSpanContext *ctx = api->span_current_context();
+```
 
-/* Try to extract trace context from a SQL comment.  Returns true if
- * a traceparent was found and applied to the root context. */
+Try to extract trace context from a SQL comment. Returns true if a
+traceparent was found and applied to the root context:
+
+```c
 if (api->try_apply_sqlcommenter_context(query_string)) {
     /* ... a comment-supplied traceparent is now active ... */
 }
+```
 
-/* Make a custom sampling decision before letting a span be recorded.
- * Hooks are called per contrib/otel's sampler policy; see the v2.1
- * API docs in otel_api/otel_api.h. */
+Make a custom sampling decision before letting a span be recorded.
+Hooks are called per `otel_api`'s sampler policy; see the v2.1 API
+docs in [`otel_api/otel_api.h`](otel_api/otel_api.h):
+
+```c
 static otel_sampler_hook_type prev_sampler;
+
 static OtelSamplerDecision
 my_sampler(const OtelSamplerInput *in)
 {
