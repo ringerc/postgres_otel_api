@@ -51,19 +51,27 @@
  *
  * External modules MUST verify both:
  *
- *	   OTEL_API_MAJOR(api->version) == OTEL_TRACING_API_MAJOR   // strict
- *	   OTEL_API_MINOR(api->version) >= OTEL_TRACING_API_MINOR   // >=
+ *	   OTEL_API_MAJOR(api->version) == OTEL_TRACING_API_MAJOR
+ *	   api->struct_size >= sizeof(struct OtelTracingApi)
  *
  * Strict equality on MAJOR is intentional: an exporter built against
  * MAJOR=N has no way to know whether MAJOR=N+1 moved a function
  * pointer, changed a struct layout, or repurposed a field.  Force
  * the rebuild.
  *
- * MINOR is asymmetric: a producer at (M, N+k) is fine for a consumer
- * built at (M, N) because additive changes only add fields after the
- * prefix the consumer reads.  The other direction (consumer minor >
- * producer minor) is not safe -- the consumer would read past the
- * end of the producer's struct, hence the >= check.
+ * struct_size guards against the consumer being newer than the
+ * producer (consumer's compile-time sizeof is larger than what the
+ * producer actually exposes) --- reading past the producer's end is
+ * UB.  The other direction (producer newer than consumer) is fine:
+ * the consumer reads the prefix it knows about and ignores any
+ * appended fields.
+ *
+ * The MINOR halfword is informational only.  It used to be the
+ * load-bearing additive-extension check, but struct_size is a
+ * stronger guarantee (it survives header-drift bugs, LD_PRELOAD
+ * mismatches, and the .so-vs-header skew cases where two parties
+ * disagree on the struct layout without disagreeing on the version
+ * number).
  *
  * Use OTEL_MAKE_VERSION(maj, min) to construct version literals.
  * Use OTEL_API_MAJOR(v) and OTEL_API_MINOR(v) to extract halfwords.
@@ -112,12 +120,41 @@
 typedef struct OtelTracingApi
 {
 	/*
-	 * Set to OTEL_TRACING_API_VERSION at module init.  External
-	 * consumers must verify both halfwords match what they were
-	 * compiled against (strict on MAJOR, >= on MINOR); see the
-	 * comment on OTEL_TRACING_API_VERSION.
+	 * Set to OTEL_TRACING_API_VERSION at module init.  Halfword-
+	 * packed MAJOR/MINOR.  Today the MAJOR halfword must match
+	 * strictly; the MINOR halfword is informational (the load-bearing
+	 * compatibility check is struct_size below).
 	 */
 	uint32		version;
+
+	/*
+	 * sizeof(OtelTracingApi) at the producer's compile time.  Consumers
+	 * compare this against their own compile-time sizeof to detect
+	 * struct-layout mismatch independently of the version halfwords.
+	 *
+	 * The two fields together form the load-bearing compatibility
+	 * check:
+	 *
+	 *	   OTEL_API_MAJOR(api->version) != OTEL_TRACING_API_MAJOR
+	 *	       -> incompatible struct layout / repurposed fields.
+	 *	   api->struct_size < sizeof(struct OtelTracingApi)
+	 *	       -> producer is older than my header; reading past the
+	 *	          producer's end is UB.
+	 *	   otherwise -> safe to use up to sizeof(*api); any further
+	 *	                fields the producer exposes are ignored.
+	 *
+	 * Placed immediately after version so its offset stays at a
+	 * fixed, layout-independent position (4 bytes in) forever ---
+	 * a consumer can read version + struct_size before relying on
+	 * any compile-time knowledge of the rest of the struct.
+	 *
+	 * Pre-1.0 status note: until the API is declared stable (1.0+),
+	 * we use struct_size for layout validation without bumping
+	 * MAJOR on additive changes.  Consumers must rebuild whenever
+	 * the struct grows; struct_size catches "you forgot to rebuild"
+	 * at runtime.
+	 */
+	uint32		struct_size;
 
 	/*
 	 * Register a span emit callback.  If prev_out is non-NULL, the
