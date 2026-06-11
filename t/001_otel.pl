@@ -304,6 +304,42 @@ run_query($sock, 'COMMIT');
 run_query($sock, "SET debug_parallel_query = off");
 
 # ----------------------------------------------------------------------
+# Test 7: W3C forward-compat --- higher-version traceparents (anything
+# other than "00", up to "fe") are parsed for their known 55-char
+# prefix; trailing fields are accepted and ignored.  Version "ff" is
+# W3C-reserved and must be rejected.
+# ----------------------------------------------------------------------
+
+# Future version with no trailing fields: take the 55-char prefix as-is.
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' => "01-$TRACE_ID-$SPAN_ID-$FLAGS"));
+my @v01_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
+is(first_value(@v01_msgs), "00-$TRACE_ID-$SPAN_ID-$FLAGS",
+	'v01 traceparent parsed for known prefix; returned via SQL surface with version pin "00"');
+
+# Future version with trailing additional fields --- spec mandates that
+# the parser MUST accept and ignore them.
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' =>
+		"01-$TRACE_ID-$SPAN_ID-$FLAGS-future-field-data"));
+my @v01ext_msgs = run_query($sock, 'SELECT otel_current_traceparent()');
+is(first_value(@v01ext_msgs), "00-$TRACE_ID-$SPAN_ID-$FLAGS",
+	'v01 traceparent with trailing fields is accepted; trailing data ignored');
+
+# "ff" is W3C-reserved invalid.  The check-hook should reject; the
+# previously-active context survives because the malformed value is a
+# no-op (same behaviour as for any other malformed input).
+$log_offset = -s $node->logfile;
+send_msg($sock, 'M', headers_body('otel.traceparent' => "ff-$TRACE_ID-$SPAN_ID-$FLAGS"));
+run_query($sock, 'SELECT 8');
+my $ff_log =
+  PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
+like(
+	$ff_log,
+	qr/TR\[\] SP\[\] LOG:\s+statement: SELECT 8/,
+	'version "ff" traceparent is rejected; no trace context applied');
+
+# ----------------------------------------------------------------------
 # Tidy up.
 # ----------------------------------------------------------------------
 

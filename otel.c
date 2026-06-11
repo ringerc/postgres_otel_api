@@ -102,7 +102,7 @@
  *	 The PRIMARY entry point is the per-message 'M' RequestHeaders
  *	 protocol message: the client sends an otel_api.traceparent header
  *	 with the next Query, the handler attaches it for the duration
- *	 of that transaction, and our XactCallback (otel_xact_callback)
+ *	 of that transaction, and our XactCallback (otel_api_xact_callback)
  *	 auto-clears it at top-level COMMIT / ROLLBACK / PREPARE.  Note
  *	 that dispatch is deferred --- core's protocol-headers
  *	 dispatcher invokes our set_cb at the start of the next
@@ -155,7 +155,7 @@
  *		 single-statement-per-message protocol use (each Query
  *		 message can carry its own headers) and naturally
  *		 transaction-scoped under explicit BEGIN/COMMIT because
- *		 our otel_xact_callback clears the in-memory derived
+ *		 our otel_api_xact_callback clears the in-memory derived
  *		 state at top-level transaction end.
  *	   * Connection-pooler interaction.  SET state on a pooled
  *		 connection in TRANSACTION or STATEMENT mode pooling can
@@ -297,7 +297,7 @@ assign_traceparent(const char *newval, void *extra)
 /*
  * Tracks whether the in-memory otel_ctx was last populated by an 'M'
  * header (as opposed to a user-issued SET or a sqlcommenter parse).
- * Read by otel_xact_callback to decide whether to clear at top-level
+ * Read by otel_api_xact_callback to decide whether to clear at top-level
  * transaction end --- only M-installed context is transaction-scoped
  * by default; SET-installed context lives at whatever scope the user
  * chose (SET = session; SET LOCAL = transaction, handled by the GUC
@@ -351,7 +351,7 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
 							 GUC_ACTION_SET, true, LOG, false);
 
 	/*
-	 * Mark the in-memory state as M-installed so otel_xact_callback
+	 * Mark the in-memory state as M-installed so otel_api_xact_callback
 	 * will clear it at top-level transaction end.  We check
 	 * otel_ctx.is_set so that if the GUC machinery rejected the value
 	 * (malformed traceparent), we don't promise a clear that doesn't
@@ -407,7 +407,7 @@ otel_set_cb(const char *key, const char *value, void *cb_ctx)
  * registration did.
  */
 static void
-otel_xact_callback(XactEvent event, void *arg)
+otel_api_xact_callback(XactEvent event, void *arg)
 {
 	switch (event)
 	{
@@ -573,7 +573,7 @@ _PG_init(void)
 	 * dispatcher under PROTOCOL_HEADER_SCOPE_TRANSACTION.
 	 */
 	RegisterProtocolHeaderHandler("otel.", otel_set_cb, NULL);
-	RegisterXactCallback(otel_xact_callback, NULL);
+	RegisterXactCallback(otel_api_xact_callback, NULL);
 #endif
 
 	/* otel_log_install_hooks() and otel_trace_install_hooks() moved
@@ -589,25 +589,63 @@ _PG_init(void)
 /*
  * Parse a W3C traceparent value into *out.  Returns true on success.
  *
- * Format: "{version}-{trace-id}-{parent-id}-{flags}" where
- *	 version		2 lowercase hex chars; only "00" is currently
- *					accepted (per the W3C spec, future versions may
- *					append fields after the flags).
+ * Format: "{version}-{trace-id}-{parent-id}-{flags}[-future-fields]"
+ *
+ *	 version		2 lowercase hex chars.  Version "00" is the only
+ *					version this code knows in detail; per the W3C
+ *					spec, higher versions MUST be parsed by reading
+ *					the known prefix (trace-id, parent-id, flags) and
+ *					ignoring any trailing additional fields.  Version
+ *					"ff" is W3C-reserved as invalid.
  *	 trace-id		32 lowercase hex chars, not all-zeros.
  *	 parent-id		16 lowercase hex chars, not all-zeros.
  *	 flags			2 lowercase hex chars.
+ *
+ * For version "00" the input MUST be exactly 55 chars.  For higher
+ * versions the input MUST be at least 55 chars and the byte at
+ * position 55 (if present) MUST be a hyphen introducing trailing
+ * fields, which this implementation accepts and ignores.
  */
 static bool
 parse_traceparent(const char *s, OtelContext *out)
 {
-	if (strlen(s) != OTEL_TRACEPARENT_LEN)
+	size_t		len = strlen(s);
+	bool		is_v00;
+
+	if (len < OTEL_TRACEPARENT_LEN)
 		return false;
 	if (s[2] != '-' || s[35] != '-' || s[52] != '-')
 		return false;
 
-	/* only version "00" is supported */
-	if (s[0] != '0' || s[1] != '0')
+	/*
+	 * Version: must be lowercase hex.  "ff" is reserved as invalid by
+	 * the W3C spec.  "00" enables strict-parse mode; anything else
+	 * (01..fe) is treated as a future version and parsed for the
+	 * known prefix only.
+	 */
+	if (!all_hex(s, 2))
 		return false;
+	if (s[0] == 'f' && s[1] == 'f')
+		return false;
+	is_v00 = (s[0] == '0' && s[1] == '0');
+
+	/*
+	 * Length / trailing-field policy.
+	 *	 v00:        exactly 55 chars, no trailing fields allowed.
+	 *	 v01..vfe:   55 chars OK; longer OK iff char 55 is '-' (a new
+	 *	             field separator) --- the trailing data is parsed
+	 *	             out by future implementations and ignored here.
+	 */
+	if (is_v00)
+	{
+		if (len != OTEL_TRACEPARENT_LEN)
+			return false;
+	}
+	else
+	{
+		if (len > OTEL_TRACEPARENT_LEN && s[OTEL_TRACEPARENT_LEN] != '-')
+			return false;
+	}
 
 	if (!all_hex(s + 3, OTEL_TRACE_ID_LEN))
 		return false;
