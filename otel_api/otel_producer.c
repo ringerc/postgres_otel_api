@@ -425,8 +425,21 @@ unwind_to(int target_top, const char *reason)
  * MemoryContextCallback driver.  Called when the consumer's
  * CurrentMemoryContext (at push time) is reset or deleted ---
  * typically because ereport unwound through it.  Find the matching
- * span_id in the stack and unwind everything from that entry up to
- * the current top.
+ * span_id in the stack and unwind THAT ENTRY ONLY.
+ *
+ * Critically: we do NOT touch entries above the matched one.  A
+ * producer that pushes A under context ctx-A, then
+ * MemoryContextSwitchTo(ctx-B) and pushes B (with ctx-B's reset
+ * scope), produces a stack with A at a lower index than B but a
+ * callback registered against ctx-A.  When ctx-A resets, this
+ * callback fires for A's entry.  B was pushed under ctx-B, which
+ * has not been reset; B's stack entry must survive.
+ *
+ * Implementation: remove the matched entry in place and slide
+ * entries above it down by one.  span_stack_top decrements by one.
+ * Lookup keys (span_id) are stable across the move because each
+ * entry is a value-copy.  Callbacks for entries that moved still
+ * find their span_id via memcmp at the new index.
  */
 static void
 on_memory_context_reset(void *arg)
@@ -436,13 +449,30 @@ on_memory_context_reset(void *arg)
 
 	for (i = span_stack_top; i >= 0; i--)
 	{
-		if (memcmp(span_stack[i].span_id, node->span_id,
+		OtelSpanStackEntry *e = &span_stack[i];
+
+		if (memcmp(e->span_id, node->span_id,
 				   sizeof(node->span_id)) == 0)
 		{
-			/* Found it.  Drain from current top down to and including
-			 * this entry.  Drain target is i - 1 because unwind_to is
-			 * exclusive (drains while top > target). */
-			unwind_to(i - 1, "unwound by ereport");
+			/* Apply unwind_policy to THIS entry only. */
+			if (e->unwind_policy == OTEL_UNWIND_ERROR && e->span != NULL)
+			{
+				if (e->span->status == OTEL_STATUS_UNSET)
+					e->span->status = OTEL_STATUS_ERROR;
+				e->span->status_description = "unwound by ereport";
+				e->span->end_time = GetCurrentTimestamp();
+				dispatch_span(e->span);
+			}
+
+			/* Remove the matched entry; slide entries above down by
+			 * one to keep the stack contiguous.  For a top-of-stack
+			 * match the loop body executes zero times --- a
+			 * straightforward pop. */
+			for (int j = i; j < span_stack_top; j++)
+				span_stack[j] = span_stack[j + 1];
+			memset(&span_stack[span_stack_top], 0,
+				   sizeof(span_stack[span_stack_top]));
+			span_stack_top--;
 			return;
 		}
 	}
