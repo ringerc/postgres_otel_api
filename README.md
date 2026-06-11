@@ -106,6 +106,35 @@ All four are loadable PostgreSQL modules (`.so`) activated via
 `shared_preload_libraries`. `otel_api` must come first in the
 preload list; the others depend on its rendezvous variable.
 
+> [!IMPORTANT]
+> **Known design challenge: operator-visible preload ordering.**
+> Requiring `otel_api` to appear first in `shared_preload_libraries`
+> is an antipattern --- it doesn't survive config management,
+> alphabetical sorting, or someone else adding a preload entry
+> without reading this README. The current implementation relies on
+> `_PG_init` order because the rendezvous variable that consumers
+> look up is populated by `otel_api`'s init and must exist before any
+> consumer's init runs.
+>
+> Alternatives we want to explore, none yet implemented:
+>
+> * **Two-phase init**: consumers register a deferred-init callback
+>   at `_PG_init`, fired by `otel_api` once its rendezvous variable
+>   is published. Order-independent at the cost of a new init
+>   contract.
+> * **Lazy first-use lookup**: each consumer looks up the rendezvous
+>   variable at first use rather than at `_PG_init`. Works today if
+>   producers retry on NULL, but pushes the cost into every span
+>   path.
+> * **Promote `otel_api` to core**: a core-resident span API doesn't
+>   have the rendezvous-bootstrapping problem at all. This is one
+>   of the strongest arguments for not keeping `otel_api` in
+>   contrib forever (see the closing note in the section above).
+>
+> Until one of those lands, the documented preload order is
+> load-bearing. PR review feedback regularly cites this as a real
+> design smell, and we agree.
+
 ## Status
 
 Pre-release, version 0.1.x. The on-wire and on-disk APIs are
