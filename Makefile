@@ -11,7 +11,7 @@
 # All targets here are pure delegators; the per-extension Makefiles
 # are PGXS-aware and handle the actual build, install, and feature-
 # probe decisions. See the per-extension Makefiles for details on
-# the ENABLE_PROTOCOL_HEADERS and ENABLE_ERRANNOT overrides.
+# the ENABLE_TRACE_CONTEXT and ENABLE_ERRANNOT overrides.
 #
 # Usage:
 #
