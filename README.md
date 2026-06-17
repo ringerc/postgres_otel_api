@@ -102,38 +102,47 @@ Four extensions in one repo:
 | [`otel_demo_exporter/`](otel_demo_exporter/) | `otel_demo_exporter` | Bare-minimum file exporter — writes one JSON line per emitted span to a file. Useful for development; not for production. |
 | [`tests/otel_test_exporter/`](tests/otel_test_exporter/) | `test_otel_exporter` | Test-only span exporter used by the TAP suites. Built but **not installed by default** (`make install` skips it). Available via `make install-test-modules` if you want it for your own development. |
 
-All four are loadable PostgreSQL modules (`.so`) activated via
-`shared_preload_libraries`. `otel_api` must come first in the
-preload list; the others depend on its rendezvous variable.
+All four are loadable PostgreSQL modules (`.so`). `otel_api` must be
+loaded at backend start (via any preload mechanism); producers and
+exporters are order-independent with respect to `otel_api` and each
+other.
 
-> [!IMPORTANT]
-> **Known design challenge: operator-visible preload ordering.**
-> Requiring `otel_api` to appear first in `shared_preload_libraries`
-> is an antipattern --- it doesn't survive config management,
-> alphabetical sorting, or someone else adding a preload entry
-> without reading this README. The current implementation relies on
-> `_PG_init` order because the rendezvous variable that consumers
-> look up is populated by `otel_api`'s init and must exist before any
-> consumer's init runs.
->
-> Alternatives we want to explore, none yet implemented:
->
-> * **Two-phase init**: consumers register a deferred-init callback
->   at `_PG_init`, fired by `otel_api` once its rendezvous variable
->   is published. Order-independent at the cost of a new init
->   contract.
-> * **Lazy first-use lookup**: each consumer looks up the rendezvous
->   variable at first use rather than at `_PG_init`. Works today if
->   producers retry on NULL, but pushes the cost into every span
->   path.
-> * **Promote `otel_api` to core**: a core-resident span API doesn't
->   have the rendezvous-bootstrapping problem at all. This is one
->   of the strongest arguments for not keeping `otel_api` in
->   contrib forever (see the closing note in the section above).
->
-> Until one of those lands, the documented preload order is
-> load-bearing. PR review feedback regularly cites this as a real
-> design smell, and we agree.
+### Supported load paths
+
+| Who | Recommended mechanism | Alternatives |
+|---|---|---|
+| `otel_api` | `shared_preload_libraries` (must be at backend start) | — |
+| `otel_postgres_tracing` | `shared_preload_libraries` (cluster-wide) | `session_preload_libraries`, `local_preload_libraries`, or `LOAD` (best-effort, current backend only) |
+| `otel_demo_exporter` / exporters | `shared_preload_libraries` (cluster-wide) | Same as above |
+
+**Preload order no longer matters.** `otel_api` may appear anywhere in
+`shared_preload_libraries`, including after its consumers. Two
+mechanisms make this work:
+
+* **Producers** (`otel_postgres_tracing`) use a static-first lazy
+  getter (`otel_api_get()`) to resolve the provider on their first
+  hot-path invocation (after all `_PG_init`s have completed). The
+  cost is a single pointer-compare on every span path; zero cost when
+  the provider is absent.
+
+* **Exporters** (`otel_demo_exporter`, `test_otel_exporter`) use a
+  two-phase deferred registration helper
+  (`otel_api_register_when_ready()`): if the provider is already
+  present, registration is immediate; if not, the request is queued in
+  a second rendezvous variable (`OtelTracingApiPending`) and the
+  provider drains the queue when it publishes its own slot.
+
+**Provider-absent behaviour** (no `otel_api` in preload at all): all
+consumers degrade silently to a zero-cost no-op. No ERROR, no WARNING
+spam. The WARNING fires exactly once per translation unit only when a
+provider is present but has an incompatible version.
+
+**Late load (`LOAD` or function-triggered):** accepted with
+best-effort, current-backend-only semantics — spans are captured from
+the point of registration onward in the current backend. No ERROR.
+`shared_preload_libraries` is still the recommended default for
+cluster-wide coverage because it covers every backend automatically via
+fork.
 
 ## Status
 
@@ -178,9 +187,10 @@ shape; the snippets here elide it for brevity.
 emitted spans somewhere</summary>
 
 ```c
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>    /* includes otel.h + lazy getter */
 
 static otel_span_emit_hook_type prev_hook;
+static OtelPendingRegistration my_reg;  /* file-scope: outlives _PG_init */
 
 static void
 my_exporter_emit(const OtelSpan *span)
@@ -195,8 +205,12 @@ my_exporter_emit(const OtelSpan *span)
 }
 
 void _PG_init(void) {
-    /* ... rendezvous lookup + version check elided ... */
-    otel_api->register_emit_hook(my_exporter_emit, &prev_hook);
+    /* Order-independent registration: immediate if otel_api is already
+     * present; deferred (drained at provider _PG_init) otherwise. */
+    memset(&my_reg, 0, sizeof(my_reg));
+    my_reg.emit_hook    = my_exporter_emit;
+    my_reg.emit_prev_out = &prev_hook;
+    otel_api_register_when_ready(&my_reg);
 }
 ```
 
@@ -223,30 +237,37 @@ the stack entry stores NULL for the borrowed pointer, so there is
 structurally no dangling-pointer hazard.
 
 ```c
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>    /* includes otel.h + lazy getter */
 
 static const OtelInstrumentationScope *my_scope;
 
 void _PG_init(void) {
-    /* ... rendezvous lookup + version check elided ... */
-    my_scope = otel_api->tracer_register("my_extension", MY_VERSION, NULL);
+    /* Scope registered lazily on first use; nothing needed here. */
 }
 
 void
 do_traced_work(const char *target)
 {
+    const OtelTracingApi *api = otel_api_get();
     OtelSpan span;
 
-    otel_api->span_init(&span, my_scope, "my_extension.do_work",
+    if (api == NULL)
+        return;    /* provider absent — silent no-op */
+
+    /* Register scope once on first successful api resolution. */
+    if (my_scope == NULL)
+        my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+
+    api->span_init(&span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
-    otel_api->span_link_to_active_and_push(&span);
-    otel_api->span_add_attribute_string(&span, "my.target", target);
+    api->span_link_to_active_and_push(&span);
+    api->span_add_attribute_string(&span, "my.target", target);
 
     /* ... do the work; ereport(ERROR) here silently drops the span ... */
 
     otel_span_set_status(&span, OTEL_STATUS_OK, NULL);
     otel_span_finalize(&span);
-    otel_api->span_emit(&span);   /* pops the stack + dispatches */
+    api->span_emit(&span);   /* pops the stack + dispatches */
 }
 ```
 
@@ -291,36 +312,43 @@ message and asserts in cassert builds — those contexts don't reset
 on ereport, so the safety net would never fire.
 
 ```c
-#include <otel_api/otel.h>
+#include <otel_api/otel_api.h>    /* includes otel.h + lazy getter */
 
 static const OtelInstrumentationScope *my_scope;
 
 void _PG_init(void) {
-    /* ... rendezvous lookup + version check elided ... */
-    my_scope = otel_api->tracer_register("my_extension", MY_VERSION, NULL);
+    /* Scope registered lazily on first use (see do_traced_work below). */
 }
 
 void
 do_traced_work(const char *target)
 {
+    const OtelTracingApi *api = otel_api_get();
+    OtelSpan   *span;
+
+    if (api == NULL)
+        return;    /* provider absent — silent no-op */
+
+    if (my_scope == NULL)
+        my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
+
     /* Must outlive the unwind: palloc'd here, but a static slab
      * (cf. otel_postgres_tracing's span_storage) works too. */
-    OtelSpan   *span = MemoryContextAlloc(CurrentMemoryContext,
-                                          sizeof(OtelSpan));
+    span = MemoryContextAlloc(CurrentMemoryContext, sizeof(OtelSpan));
 
-    otel_api->span_init(span, my_scope, "my_extension.do_work",
+    api->span_init(span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
     otel_span_set_unwind_policy(span, OTEL_UNWIND_ERROR);
 
-    otel_api->span_link_to_active_and_push(span);
-    otel_api->span_add_attribute_string(span, "my.target", target);
+    api->span_link_to_active_and_push(span);
+    api->span_add_attribute_string(span, "my.target", target);
 
     /* ... do the work; ereport(ERROR) here -> span emitted with
      *     status=ERROR, end_time=now, descriptive message ... */
 
     otel_span_set_status(span, OTEL_STATUS_OK, NULL);
     otel_span_finalize(span);
-    otel_api->span_emit(span);   /* pops the stack + dispatches */
+    api->span_emit(span);   /* pops the stack + dispatches */
 }
 ```
 
@@ -352,7 +380,8 @@ invoke it directly if it sees SQL text that bypasses that hook
 (e.g. a custom protocol layer or batched-statement parser):
 
 ```c
-if (otel_api->try_apply_sqlcommenter_context(query_string)) {
+const OtelTracingApi *api = otel_api_get();
+if (api && api->try_apply_sqlcommenter_context(query_string)) {
     /* ... a comment-supplied traceparent is now active ... */
 }
 ```
@@ -362,7 +391,10 @@ if (otel_api->try_apply_sqlcommenter_context(query_string)) {
 [`otel_api/otel_api.h`](otel_api/otel_api.h):
 
 ```c
+#include <otel_api/otel_api.h>
+
 static otel_sampler_hook_type prev_sampler;
+static OtelPendingRegistration my_sampler_reg;
 
 static OtelSamplerDecision
 my_sampler(const OtelSamplerInput *in)
@@ -374,15 +406,18 @@ my_sampler(const OtelSamplerInput *in)
 }
 
 void _PG_init(void) {
-    /* ... rendezvous lookup elided ... */
-    otel_api->register_sampler_hook(my_sampler, &prev_sampler);
+    memset(&my_sampler_reg, 0, sizeof(my_sampler_reg));
+    my_sampler_reg.sampler_hook     = my_sampler;
+    my_sampler_reg.sampler_prev_out = &prev_sampler;
+    otel_api_register_when_ready(&my_sampler_reg);
 }
 ```
 
 If you do need read-only access to the propagated context for some
 other purpose (custom log lines, exporting context to another
-signal type), `otel_api->get_root_context_snapshot()` and
-`otel_api->span_current_context()` are available — see the header.
+signal type), `api->get_root_context_snapshot()` and
+`api->span_current_context()` are available — see the header
+(`api = otel_api_get()` first).
 
 Fully worked examples:
 
@@ -431,8 +466,10 @@ Then in `postgresql.conf`:
 
 ```ini
 shared_preload_libraries = 'otel_api,otel_postgres_tracing,otel_demo_exporter'
-# otel_api MUST come first --- it publishes the rendezvous variable
-# that the other two consume.
+# otel_api may appear anywhere in this list; preload order no longer matters.
+# otel_api itself must be in some preload list (it owns global state and hooks);
+# otel_postgres_tracing and otel_demo_exporter may also be loaded via
+# session_preload_libraries, local_preload_libraries, or LOAD.
 ```
 
 Restart, then in each database that wants the extension:
