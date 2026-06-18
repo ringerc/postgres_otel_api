@@ -259,23 +259,32 @@ EOCONF
 }
 
 # -----------------------------------------------------------------------
-# Sub-test 4: Late LOAD path.
-# otel_api + otel_postgres_tracing preloaded; no exporter preloaded.
-# LOAD the demo exporter mid-session; assert no ERROR, and spans after
-# LOAD are captured.
+# Sub-test 4: True mid-session LOAD path (alt #2).
+#
+# otel_api + otel_postgres_tracing are preloaded (cluster-wide) but NO
+# exporter is preloaded.  The test opens a single connection and issues
+# LOAD 'test_otel_exporter' mid-session, verifying:
+#
+#   a) LOAD does NOT raise an ERROR (core of alt #2: late load tolerated).
+#   b) A traced span emitted AFTER the LOAD is captured by the exporter.
+#
+# Best-effort / current-backend-only semantics: spans emitted before the
+# LOAD are not asserted here (the emit hook is installed at LOAD time, so
+# earlier spans are simply not seen by this exporter in this backend).
 # -----------------------------------------------------------------------
 
 {
-	note "Sub-test 4: late LOAD of exporter mid-session";
+	note "Sub-test 4: true mid-session LOAD of exporter (alt #2)";
 
 	my $node = PostgreSQL::Test::Cluster->new('late_load');
 	$node->init;
 	$node->append_conf('postgresql.conf', <<EOCONF);
-shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing'
 log_min_messages = warning
 EOCONF
 	$node->start;
 
+	# Install the extension catalog entries (DDL only, no preload).
 	$node->safe_psql('postgres',
 		'CREATE EXTENSION otel_api; CREATE EXTENSION test_otel_exporter');
 
@@ -290,25 +299,41 @@ EOCONF
 	send_startup($sock, user => $superuser, database => 'postgres');
 	drain_to_rfq($sock);
 
-	# LOAD must not ERROR.
-	my @load_msgs = run_query($sock, q{SELECT test_otel_clear()});
-	# Run a traced query AFTER the exporter is already loaded (via preload).
+	# --- core of alt #2: LOAD mid-session must NOT raise an ERROR ---
+	#
+	# test_otel_exporter._PG_init accepts any load mechanism (including a
+	# bare LOAD) and registers via otel_api_register_when_ready().  Since
+	# the provider (otel_api) is already present in this backend, the
+	# registration happens immediately.
+	my @load_msgs = run_query($sock, q{LOAD 'test_otel_exporter'});
+	my $load_errored = grep { $_->[0] eq 'E' } @load_msgs;
+	ok(!$load_errored,
+		'LOAD test_otel_exporter mid-session does not ERROR');
+
+	# Discard any spans emitted before or during LOAD (best-effort: we
+	# only assert capture from the point of registration onward).
+	run_query($sock, 'SELECT test_otel_clear()');
+
+	# Emit a traced span AFTER the LOAD.  Use a propagated traceparent so
+	# otel_postgres_tracing creates a child span unconditionally.
 	send_msg($sock, 'M', headers_body('otel.traceparent' => $TRACEPARENT));
-	run_query($sock, 'SELECT 42');
+	run_query($sock, 'SELECT 1');
 
 	my @msgs = run_query($sock, 'SELECT test_otel_span_count()');
 	is(first_value(@msgs), '1',
-		'span captured after exporter registration');
+		'span captured after mid-session LOAD of exporter');
 
 	@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
 	my $span = first_value(@msgs);
 	like($span, qr/trace_id=$TRACE_ID/,
-		'span carries propagated trace_id (late-load path)');
+		'span carries propagated trace_id (mid-session LOAD path)');
+	like($span, qr/parent_span_id=$SPAN_ID/,
+		'span carries propagated parent_span_id (mid-session LOAD path)');
 
-	# Confirm no ERROR in the log from the LOAD.
+	# Belt-and-suspenders: confirm the server log is free of otel ERRORs.
 	my $log_contents = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 	unlike($log_contents, qr/ERROR.*otel/i,
-		'no ERROR from otel modules during late LOAD');
+		'no ERROR from otel modules during or after mid-session LOAD');
 
 	send_msg($sock, 'X');
 	$sock->close();
