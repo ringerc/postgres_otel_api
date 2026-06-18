@@ -563,8 +563,10 @@ typedef struct OtelPendingRegistration
  * onto the pending list; the provider drains it when it publishes its
  * rendezvous slot.
  *
- * req must be allocated in TopMemoryContext (the provider may drain the
- * list long after the caller's _PG_init stack frame has returned).
+ * *req must have process/static lifetime: either a file-static node (BSS)
+ * or one allocated in TopMemoryContext.  Both are correct because the
+ * provider may drain the pending list long after the caller's _PG_init
+ * stack frame has returned; the node must remain valid until then.
  * All pointer fields in *req that the caller does not use must be NULL.
  */
 static inline void
