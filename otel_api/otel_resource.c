@@ -62,12 +62,12 @@ char	   *otel_service_name_guc = NULL;
 char	   *otel_service_instance_id_guc = NULL;
 
 /*
- * Resource attribute storage.  Populated once at _PG_init under
+ * Resource attribute storage.  Populated at _PG_init under
  * TopMemoryContext so the strings outlive every per-statement context.
- * Sized for the three attributes the module produces today; if the
- * set grows, bump the dimension.
+ * Sized generously so that extensions can add attributes via
+ * otel_resource_add() after _PG_init completes.
  */
-#define OTEL_RESOURCE_ATTR_CAPACITY		3
+#define OTEL_RESOURCE_ATTR_CAPACITY		16
 static OtelResourceAttribute otel_resource_attrs[OTEL_RESOURCE_ATTR_CAPACITY];
 static int	otel_resource_n_attrs = 0;
 
@@ -78,6 +78,58 @@ push_resource_attr(const char *key, const char *value)
 	otel_resource_attrs[otel_resource_n_attrs].key = key;
 	otel_resource_attrs[otel_resource_n_attrs].value = value;
 	otel_resource_n_attrs++;
+}
+
+/*
+ * otel_resource_add --- add or replace a resource attribute.
+ *
+ * Safe to call after _PG_init completes, before the first span is emitted
+ * in a backend.  Strings are pstrdup'd into TopMemoryContext so they
+ * remain valid for the backend's lifetime.  If `key` is already present,
+ * the value is updated in place (last-write-wins); otherwise a new entry
+ * is appended.
+ *
+ * Called from extension _PG_init callbacks or deferred initialization
+ * hooks (e.g. ExecutorStart, ProcessUtility) to publish per-process
+ * identity after catalog data becomes accessible.
+ */
+void
+otel_resource_add(const char *key, const char *value)
+{
+	MemoryContext oldcxt;
+	int			i;
+
+	if (key == NULL || key[0] == '\0')
+		return;
+
+	/* Search for an existing entry with the same key. */
+	for (i = 0; i < otel_resource_n_attrs; i++)
+	{
+		if (otel_resource_attrs[i].key != NULL &&
+			strcmp(otel_resource_attrs[i].key, key) == 0)
+		{
+			/* Update value in place. */
+			oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+			otel_resource_attrs[i].value = pstrdup(value ? value : "");
+			MemoryContextSwitchTo(oldcxt);
+			return;
+		}
+	}
+
+	/* Append a new entry. */
+	if (otel_resource_n_attrs >= OTEL_RESOURCE_ATTR_CAPACITY)
+	{
+		ereport(WARNING,
+				(errmsg("otel_resource_add: resource attribute capacity (%d) exceeded; ignoring key \"%s\"",
+						OTEL_RESOURCE_ATTR_CAPACITY, key)));
+		return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	otel_resource_attrs[otel_resource_n_attrs].key = pstrdup(key);
+	otel_resource_attrs[otel_resource_n_attrs].value = pstrdup(value ? value : "");
+	otel_resource_n_attrs++;
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
