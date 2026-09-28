@@ -57,7 +57,7 @@ PG_MODULE_MAGIC;
  * registration call is needed with the new producer API.
  * Declared in otel_postgres_tracing.h.
  */
-OtelTracer	otel_pg_tracer = {.name = "contrib/otel_postgres_tracing", .version = PG_VERSION};
+OtelTracer	otel_pg_tracer = {.name = "otel_postgres_tracing", .version = PG_VERSION};
 
 /*
  * GUC controlling whether spans are emitted for queries that
