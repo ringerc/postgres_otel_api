@@ -977,7 +977,20 @@ start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
 
 	n = &nrecs[idx];
 	n->gen = next_gen();
-	n->nest_level = GetCurrentTransactionNestLevel();
+
+	/*
+	 * An unsampled span has no resource owner; transaction and
+	 * subtransaction end drop it by level.  One that would have been a
+	 * session span, as a recording span, gets level 0 so no transaction
+	 * end drops it.  A default-owner span is dropped at the end of its
+	 * (sub)transaction, a little later than a recording span would be
+	 * (at the end of its statement's portal).
+	 */
+	if (args->owner == OTEL_OWNER_SESSION ||
+		(args->owner == NULL && CurrentResourceOwner == NULL))
+		n->nest_level = 0;
+	else
+		n->nest_level = GetCurrentTransactionNestLevel();
 	n->detached = args->detached;
 	n->have_span_id = false;
 	memset(&n->ctx, 0, sizeof(n->ctx));
