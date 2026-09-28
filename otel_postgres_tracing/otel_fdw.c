@@ -112,23 +112,30 @@ static int	fdw_scan_depth = 0;
 
 
 /*
- * Open a pg.fdw.scan span for one ForeignScanState.  It is pushed onto the
- * active stack by default (nests under the current span); our own tracking
- * stack lets the matching end find it again.  No-op when the stack is full,
- * or when nothing should record (otel_span_start returns OTEL_SPAN_NONE and
- * push is a no-op).
+ * Open a pg.fdw.scan span for one ForeignScanState.  Our tracking stack
+ * lets the matching end find it again.  No-op when the stack is full, or
+ * when nothing should record (otel_span_start returns OTEL_SPAN_NONE).
  */
 static void
 otel_fdw_scan_begin(ForeignScanState *node)
 {
 	OtelSpanRef s;
+	OtelSpanRef parent = otel_span_current();
 
 	if (fdw_scan_depth >= OTEL_FDW_SCAN_STACK_MAX)
 		return;
 
+	/*
+	 * Scans of several foreign tables can be open at once and end in any
+	 * order (joins, async append), so the span is detached, as a child of
+	 * whatever is active when the scan begins.
+	 */
 	s = otel_span_start(.tracer = &otel_pg_tracer,
 						.name = "pg.fdw.scan",
-						.kind = OTEL_SPAN_KIND_CLIENT);
+						.kind = OTEL_SPAN_KIND_CLIENT,
+						.detached = true,
+						.parent = parent.v != 0 ? OTEL_PARENT_SPAN : OTEL_PARENT_ACTIVE,
+						.parent_span = parent);
 	if (s.v == 0)
 		return;
 

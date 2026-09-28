@@ -47,7 +47,17 @@ typedef struct OtelPlanwalkContext
 	MemoryContext attr_cxt;		/* scratch context for building attribute
 								 * values; setters copy immediately, so
 								 * this need not outlive the call */
+
+	/*
+	 * The current node's ancestors in the plan tree, root first.  Only
+	 * the top OTEL_PLANWALK_MAX_ANCESTORS levels are recorded; a node
+	 * deeper than that sees only those.
+	 */
+	PlanState  *const *ancestors;
+	int			n_ancestors;
 } OtelPlanwalkContext;
+
+#define OTEL_PLANWALK_MAX_ANCESTORS 64
 
 /*
  * A collector registration entry.  Any callback may be NULL (the dispatcher

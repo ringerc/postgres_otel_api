@@ -95,20 +95,39 @@ planspans_span_name(PlanState *ps)
  * stack.  Structural attributes available at init time are added here; runtime
  * attributes (parallel worker counts) are added at node_end.
  */
+/*
+ * The span of ps's nearest ancestor that has one, else the statement span.
+ */
+static OtelSpanRef
+planspans_parent(OtelPlanwalkContext *ctx)
+{
+	for (int a = ctx->n_ancestors - 1; a >= 0; a--)
+		for (int i = planspans_depth - 1; i >= 0; i--)
+			if (planspans_stack[i].node == ctx->ancestors[a])
+				return planspans_stack[i].ref;
+	return ctx->stmt_span;
+}
+
 static void
 planspans_node_begin(PlanState *ps, OtelPlanwalkContext *ctx)
 {
 	const char *name = planspans_span_name(ps);
 	OtelSpanRef s;
 
-	(void) ctx;
-
 	if (name == NULL || planspans_depth >= OTEL_PLANSPANS_STACK_MAX)
 		return;
 
+	/*
+	 * Every node's span starts in one walk at ExecutorStart and ends in
+	 * another at ExecutorEnd, so they don't nest in the C call stack:
+	 * detached, with the plan-tree parent named explicitly.
+	 */
 	s = otel_span_start(.tracer = &otel_pg_tracer,
 						.name = name,
-						.kind = OTEL_SPAN_KIND_INTERNAL);
+						.kind = OTEL_SPAN_KIND_INTERNAL,
+						.detached = true,
+						.parent = OTEL_PARENT_SPAN,
+						.parent_span = planspans_parent(ctx));
 	if (s.v == 0)
 		return;
 
