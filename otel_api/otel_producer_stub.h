@@ -72,6 +72,7 @@ typedef struct OtelSpanStartArgs
 	bool		detached;
 	bool		scoped;
 	TimestampTz start_time;
+	bool		force_sample;
 } OtelSpanStartArgs;
 
 static inline bool otel_span_recording(OtelSpanRef s) { (void) s; return false; }
@@ -80,6 +81,7 @@ static inline OtelSpanRef otel_span_start_args(const OtelSpanStartArgs *args) { 
 	otel_span_start_args(&(OtelSpanStartArgs) { \
 		.struct_size = sizeof(OtelSpanStartArgs), __VA_ARGS__ })
 static inline void otel_span_end(OtelSpanRef s) { (void) s; }
+static inline void otel_span_discard(OtelSpanRef s) { (void) s; }
 static inline void otel_span_end_at(OtelSpanRef s, TimestampTz t) { (void) s; (void) t; }
 static inline void otel_span_set_str(OtelSpanRef s, const char *k, const char *v) { (void) s; (void) k; (void) v; }
 static inline void otel_span_set_int(OtelSpanRef s, const char *k, int64 v) { (void) s; (void) k; (void) v; }

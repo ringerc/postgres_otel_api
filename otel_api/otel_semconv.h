@@ -81,4 +81,13 @@
 /* Where a span came from, e.g. "sdt_probe" */
 #define OTEL_PG_SPAN_SOURCE				"pg.otel.span_source"
 
+/*
+ * Keys for trace context attached to server log messages with errannot().
+ * Extensions that annotate log messages with trace context should use
+ * the same keys, so log processors can correlate them.
+ */
+#define OTEL_ERRANNOT_KEY_TRACE_ID		"trace_id"
+#define OTEL_ERRANNOT_KEY_SPAN_ID		"span_id"
+#define OTEL_ERRANNOT_KEY_TRACE_FLAGS	"trace_flags"
+
 #endif							/* OTEL_SEMCONV_H */

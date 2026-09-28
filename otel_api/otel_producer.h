@@ -158,6 +158,14 @@ typedef struct OtelSpanStartArgs
 
 	/* Start time; 0 means now. */
 	TimestampTz start_time;
+
+	/*
+	 * Record the span even if sampling would drop it (an unsampled parent,
+	 * or the sampler hook).  For operator settings that ask to trace
+	 * everything, such as otel.trace_all_queries.  The span is exported
+	 * with sampled=1, and its children inherit that as usual.
+	 */
+	bool		force_sample;
 } OtelSpanStartArgs;
 
 typedef struct OtelProducerApi
@@ -217,6 +225,14 @@ typedef struct OtelProducerApi
 
 	/* Add or replace a process-level Resource attribute.  Copied. */
 	void		(*resource_add) (const char *key, const char *value);
+
+	/*
+	 * Drop the span without exporting it.  It is removed from wherever it
+	 * is on the active stack; spans above it are left alone.  For a
+	 * producer that abandons spans it knows won't be ended, e.g. from an
+	 * abort callback.
+	 */
+	void		(*span_discard) (OtelSpanRef s);
 } OtelProducerApi;
 
 
@@ -278,6 +294,13 @@ otel_span_end_at(OtelSpanRef s, TimestampTz end_time)
 {
 	if (s.v != 0)
 		otel_producer_api()->span_end(s, end_time);
+}
+
+static inline void
+otel_span_discard(OtelSpanRef s)
+{
+	if (s.v != 0)
+		otel_producer_api()->span_discard(s);
 }
 
 static inline void

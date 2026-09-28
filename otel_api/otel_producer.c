@@ -681,21 +681,36 @@ slot_record_error(OtelSlot *slot, const ErrorData *edata)
 
 /*
  * emit_log_hook: record WARNING and worse into the innermost recording
- * span.  This runs for errors that reach EmitErrorReport, which for a
- * top-level ERROR is before transaction abort releases the span; errors
- * caught before that (plpgsql EXCEPTION, C PG_CATCH) need
+ * span.  An ERROR is also recorded into every other OTEL_UNWIND_ERROR
+ * span on the stack that isn't a session span: the abort that follows
+ * ends them, and they should say why.
+ *
+ * This runs for errors that reach EmitErrorReport, which for a top-level
+ * ERROR is before transaction abort releases the spans.  Errors caught
+ * before that (plpgsql EXCEPTION, C PG_CATCH) need
  * otel_span_capture_error().
  */
 static void
 otel_emit_log_hook(ErrorData *edata)
 {
-	if (edata->elevel >= WARNING && CritSectionCount == 0 &&
-		span_stack_depth > 0)
+	if (edata->elevel >= WARNING && CritSectionCount == 0)
 	{
-		int32		e = span_stack[span_stack_depth - 1];
+		bool		innermost = true;
 
-		if (e >= 0 && !slots[e].dispatching)
-			slot_record_error(&slots[e], edata);
+		for (int i = span_stack_depth - 1; i >= 0; i--)
+		{
+			int32		e = span_stack[i];
+
+			if (e < 0 || slots[e].dispatching)
+				continue;
+			if (innermost ||
+				(edata->elevel >= ERROR && slots[e].unwind == OTEL_UNWIND_ERROR &&
+				 !slots[e].session))
+				slot_record_error(&slots[e], edata);
+			innermost = false;
+			if (edata->elevel < ERROR)
+				break;
+		}
 	}
 	if (prev_emit_log_hook)
 		prev_emit_log_hook(edata);
@@ -749,7 +764,7 @@ lower_error_event(OtelSlot *slot)
 		if (buf)
 		{
 			if (err->message)
-				snprintf(buf, 256, "%s: %s", err->sqlstate, err->message);
+				snprintf(buf, 256, "%s / %s", err->sqlstate, err->message);
 			else
 				strlcpy(buf, err->sqlstate, 256);
 			slot->span.status_description = buf;
@@ -976,6 +991,8 @@ start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
 	return make_ref(n->gen, idx, false);
 }
 
+static void nrec_context(OtelNrec *n, OtelSpanContext *out);
+
 static OtelSpanRef
 api_span_start(const OtelSpanStartArgs *args)
 {
@@ -1021,8 +1038,16 @@ api_span_start(const OtelSpanStartArgs *args)
 				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_RECORD_ONLY;
 			break;
 		case PARENT_NREC:
-			return start_nrec(args, &p, &nrecs[p.idx].ctx.trace_id,
-							  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
+			if (!args->force_sample)
+				return start_nrec(args, &p, &nrecs[p.idx].ctx.trace_id,
+								  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
+			/* Forced: a recording child of the unsampled span's context. */
+			nrec_context(&nrecs[p.idx], &p.ctx);
+			p.kind = PARENT_REMOTE;
+			trace_id = p.ctx.trace_id;
+			parent_flags = p.ctx.trace_flags;
+			decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
+			break;
 		case PARENT_REMOTE:
 			{
 				OtelSamplerInput in = {
@@ -1050,6 +1075,8 @@ api_span_start(const OtelSpanStartArgs *args)
 			}
 	}
 
+	if (args->force_sample)
+		decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
 	if (decision == OTEL_SAMPLE_DROP)
 		return start_nrec(args, &p, &trace_id, parent_flags & OTEL_TRACE_FLAG_RANDOM);
 
@@ -1550,6 +1577,37 @@ api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
 	}
 }
 
+static void
+api_span_discard(OtelSpanRef s)
+{
+	int			pos;
+
+	Assert(CritSectionCount == 0);
+	if (unlikely(CritSectionCount > 0) || s.v == 0)
+		return;
+	if (s.v < 0)
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return;
+		if ((pos = stack_find(stack_entry_for_nrec(n - nrecs))) >= 0)
+			stack_remove_at(pos);
+		free_nrec(n - nrecs, false);
+	}
+	else
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL || slot->dispatching)
+			return;
+		if ((pos = stack_find(stack_entry_for_slot(slot - slots))) >= 0)
+			stack_remove_at(pos);
+		release_slot(slot - slots, false);
+	}
+	otel_counters.spans_discarded++;
+}
+
 const OtelProducerApi otel_producer_api_table = {
 	.version = OTEL_PRODUCER_API_VERSION,
 	.struct_size = sizeof(OtelProducerApi),
@@ -1570,6 +1628,7 @@ const OtelProducerApi otel_producer_api_table = {
 	.span_current = api_span_current,
 	.span_context_of = api_span_context_of,
 	.resource_add = otel_resource_attr_add,
+	.span_discard = api_span_discard,
 };
 
 
@@ -1690,7 +1749,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 		size_t		off;
 	}			fields[] = {
 #define F(f) {#f, offsetof(OtelApiCounters, f)}
-		F(spans_started), F(spans_unsampled), F(spans_emitted),
+		F(spans_started), F(spans_unsampled), F(spans_emitted), F(spans_discarded),
 		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
 		F(start_in_crit_section), F(start_bad_args),
 		F(stale_handle), F(non_lifo_end), F(unwound_error), F(unwound_dropped),

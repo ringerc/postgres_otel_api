@@ -43,8 +43,10 @@
 typedef struct OtelPlanwalkContext
 {
 	QueryDesc  *queryDesc;		/* the active QueryDesc */
-	OtelSpan   *stmt_span;		/* the enclosing pgsql.execute span */
-	MemoryContext attr_cxt;		/* span_cxt: allocate attribute values here */
+	OtelSpanRef stmt_span;		/* the enclosing pgsql.execute span */
+	MemoryContext attr_cxt;		/* scratch context for building attribute
+								 * values; setters copy immediately, so
+								 * this need not outlive the call */
 } OtelPlanwalkContext;
 
 /*
@@ -105,10 +107,10 @@ extern void otel_planwalk_install(void);
  *                    Early-outs cheaply when no collector is enabled.
  */
 extern void otel_planwalk_executor_start(QueryDesc *queryDesc,
-										 OtelSpan *stmt_span,
+										 OtelSpanRef stmt_span,
 										 MemoryContext attr_cxt);
 extern void otel_planwalk_executor_end(QueryDesc *queryDesc,
-									   OtelSpan *stmt_span,
+									   OtelSpanRef stmt_span,
 									   MemoryContext attr_cxt);
 
 /*

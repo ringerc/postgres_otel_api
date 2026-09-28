@@ -41,6 +41,7 @@ typedef struct OtelApiCounters
 	uint64		spans_started;		/* recording spans */
 	uint64		spans_unsampled;	/* non-recording stack entries */
 	uint64		spans_emitted;
+	uint64		spans_discarded;	/* otel_span_discard() */
 
 	/* otel_span_start refused, returning OTEL_SPAN_NONE */
 	uint64		start_no_slot;		/* otel_api.max_open_spans reached */

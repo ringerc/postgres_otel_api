@@ -213,12 +213,12 @@ like($span, qr/trace_flags=$FLAGS/,
 	'trace_flags match the client value');
 
 # Expected attributes are present
-like($span, qr/attr=db\.system=postgresql/,
-	'db.system attribute is "postgresql"');
-like($span, qr/attr=db\.name=postgres/,
-	'db.name attribute is the connected database');
-like($span, qr/attr=db\.statement=SELECT 1/,
-	'db.statement attribute is the SQL text');
+like($span, qr/attr=db\.system\.name=postgresql/,
+	'db.system.name attribute is "postgresql"');
+like($span, qr/attr=db\.namespace=postgres/,
+	'db.namespace attribute is the connected database');
+like($span, qr/attr=db\.query\.text=SELECT 1/,
+	'db.query.text attribute is the SQL text');
 
 # Status is UNSET (0) for a successful query
 like($span, qr/status=0\n/,
@@ -259,7 +259,9 @@ run_query($sock, 'RESET otel.trace_all_queries');
 isnt(first_value(@msgs), '0',
 	'spans emitted under trace_all_queries even without propagated context');
 
-@msgs = run_query($sock, 'SELECT test_otel_pop_span()');
+# The SDT sub-phase spans nest under pgsql.execute and are recorded too,
+# so look the statement span up by name.
+@msgs = run_query($sock, "SELECT test_otel_pop_span_by_name('pgsql.execute')");
 $span = first_value(@msgs);
 # Parentless: parent_span_id is empty
 like($span, qr/parent_span_id=\n/,
@@ -295,16 +297,16 @@ like($span, qr/status=2\n/,
 # event whose ereport fields are carried as event attributes.
 like($span, qr/event\.name=exception\n/,
 	'ereport lowered into a generic "exception" event');
-like($span, qr/event\.attr=postgres\.elevel=21\n/,
-	'event elevel matches ERROR (21)');
-like($span, qr/event\.attr=postgres\.sqlstate=22012\n/,
-	'event sqlstate is 22012 (division_by_zero)');
+like($span, qr/event\.attr=pg\.error\.elevel=21\n/,
+	'event pg.error.elevel matches ERROR (21)');
+like($span, qr/event\.attr=exception\.type=22012\n/,
+	'event exception.type is the SQLSTATE 22012 (division_by_zero)');
 like($span, qr/event\.attr=exception\.message=division by zero/,
 	'event message captures the ereport text');
 like($span, qr/status_description=22012 \/ division by zero/,
 	'status_description is populated with SQLSTATE / message summary');
-like($span, qr/event\.attr=code\.filepath=\S*\w+\.c/,
-	'event code.filepath is a postgres source file');
+like($span, qr/event\.attr=code\.file\.path=\S*\w+\.c/,
+	'event code.file.path is a postgres source file');
 
 # Connection is now in a failed-transaction state; ROLLBACK to clear.
 run_query($sock, 'ROLLBACK');
@@ -331,7 +333,7 @@ like($span, qr/name=DO\n/,
 	'utility span name is "DO" (the command tag)');
 like($span, qr/status=0\n/,
 	'utility span status remains UNSET when only WARNING fires');
-like($span, qr/event\.attr=postgres\.elevel=19\n/,
+like($span, qr/event\.attr=pg\.error\.elevel=19\n/,
 	'WARNING-level event captured on the utility span (elevel 19)');
 like($span, qr/event\.attr=exception\.message=test-warn/,
 	'WARNING message captured on the utility span');

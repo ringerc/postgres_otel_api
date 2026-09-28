@@ -163,7 +163,7 @@ otel_planwalk_register_collector(const OtelPlanwalkCollector *c)
 }
 
 void
-otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
+otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 							 MemoryContext attr_cxt)
 {
 	PlanwalkInternalCtx ictx;
@@ -188,7 +188,7 @@ otel_planwalk_executor_start(QueryDesc *queryDesc, OtelSpan *stmt_span,
 }
 
 void
-otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpan *stmt_span,
+otel_planwalk_executor_end(QueryDesc *queryDesc, OtelSpanRef stmt_span,
 						   MemoryContext attr_cxt)
 {
 	PlanwalkInternalCtx ictx;
