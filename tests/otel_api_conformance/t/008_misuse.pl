@@ -92,11 +92,17 @@ sub check_misuse
 	}
 	else
 	{
-		my ($ret, $stdout, $stderr) = $node->psql('postgres', $sql);
+		# otel_api_conformance's counters are backend-local (see
+		# t/001_construction.pl's header comment): the counter read-back
+		# must be part of the SAME psql invocation/connection that ran
+		# $sql, not a separate counters() call (which would open a new,
+		# fresh backend reporting all-zero counters).
+		my ($ret, $stdout, $stderr) = $node->psql('postgres',
+			"$sql;\nSELECT otel_api_conformance_counters();");
 		is($ret, 0, "$desc: completes without crashing (non-cassert build)") or diag($stderr);
 		if (defined $counter_key)
 		{
-			my $c = counters();
+			my $c = decode_json($stdout);
 			cmp_ok($c->{$counter_key}, '>=', 1, "$desc: $counter_key counter increased");
 		}
 	}

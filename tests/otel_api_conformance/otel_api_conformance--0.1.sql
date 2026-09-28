@@ -277,3 +277,58 @@ CREATE FUNCTION otel_api_conformance_misuse_open_at_commit()
 RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_misuse_open_at_commit'
 LANGUAGE C VOLATILE;
+
+-- ----------------------------------------------------------------
+-- plpgsql recursion (t/011) and interleaving (t/012).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION otel_api_conformance_span_current()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'otel_api_conformance_span_current'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_discard(ref bigint)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_discard'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_with_span(name text, sql text, unwind text DEFAULT 'drop')
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'otel_api_conformance_with_span'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_with_span_catch(name text, sql text,
+	unwind text DEFAULT 'drop', after_name text DEFAULT NULL)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'otel_api_conformance_with_span_catch'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_detached_chain(n integer, order_mode text, seed bigint DEFAULT NULL)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_detached_chain'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_parent_ends_first()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_parent_ends_first'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_mixed_non_lifo_detached()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_mixed_non_lifo_detached'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_two_producer_interleave()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_two_producer_interleave'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_wide_fanout(n_children integer, seed bigint DEFAULT NULL, n_over_limit integer DEFAULT 0)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_wide_fanout'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_stress_ops(seed bigint, n_ops integer, mode text DEFAULT 'legal')
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_stress_ops'
+LANGUAGE C VOLATILE STRICT;

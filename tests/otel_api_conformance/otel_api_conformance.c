@@ -50,6 +50,7 @@
 
 #include "access/parallel.h"
 #include "access/xact.h"
+#include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
@@ -790,6 +791,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"spans_started\":" UINT64_FORMAT ","
 					  "\"spans_unsampled\":" UINT64_FORMAT ","
 					  "\"spans_emitted\":" UINT64_FORMAT ","
+					  "\"spans_discarded\":" UINT64_FORMAT ","
 					  "\"start_no_slot\":" UINT64_FORMAT ","
 					  "\"start_no_session_slot\":" UINT64_FORMAT ","
 					  "\"start_stack_full\":" UINT64_FORMAT ","
@@ -811,7 +813,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"conformance_side_effect_calls\":" INT64_FORMAT ","
 					  "\"conformance_captured\":%d"
 					  "}",
-					  c.spans_started, c.spans_unsampled, c.spans_emitted,
+					  c.spans_started, c.spans_unsampled, c.spans_emitted, c.spans_discarded,
 					  c.start_no_slot, c.start_no_session_slot, c.start_stack_full,
 					  c.start_in_crit_section, c.start_bad_args,
 					  c.stale_handle, c.non_lifo_end, c.unwound_error, c.unwound_dropped,
@@ -1758,4 +1760,791 @@ otel_api_conformance_misuse_open_at_commit(PG_FUNCTION_ARGS)
 
 	(void) s;
 	PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * SQL surface: plpgsql recursion (t/011) and interleaving (t/012).
+ *
+ * These scenarios need a span open *across* a recursive call, so the
+ * work happens in one C function per "level" rather than several SQL
+ * statements (a span with the default owner is released at the end of
+ * its own statement -- see the file header and otel_producer.h).
+ * ---------------------------------------------------------------- */
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_span_current);
+Datum
+otel_api_conformance_span_current(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef s = otel_span_current();
+
+	PG_RETURN_INT64(s.v);
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_discard);
+Datum
+otel_api_conformance_discard(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef s = {.v = PG_GETARG_INT64(0)};
+
+	otel_span_discard(s);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Starts a span, runs sql via SPI (which may recurse back into a
+ * plpgsql wrapper that calls this function again), and ends the span.
+ * If sql raises an ERROR, SPI_execute() propagates it straight through
+ * this function -- SPI_finish() and otel_span_end() are never reached,
+ * so the span unwinds via whatever resource owner it belongs to (the
+ * default: CurrentResourceOwner at the moment otel_span_start() ran),
+ * under `unwind`.  That is exactly the plpgsql-recursion pattern this
+ * scenario needs: no explicit cleanup code here means the owner/abort
+ * machinery is what gets exercised.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_with_span);
+Datum
+otel_api_conformance_with_span(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *unwind_s = PG_ARGISNULL(2) ? "drop" : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
+	OtelSpanRef s;
+	int			ret;
+
+	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = unwind);
+
+	SPI_connect();
+	ret = SPI_execute(sql, false, 0);
+	SPI_finish();
+
+	otel_span_end(s);
+
+	if (ret < 0)
+		ereport(ERROR,
+				(errmsg("otel_api_conformance_with_span: SPI_execute failed for \"%s\": %d",
+						sql, ret)));
+
+	PG_RETURN_INT64(s.v);
+}
+
+/*
+ * Like with_span, but runs sql in an internal subtransaction and catches
+ * any error from it, the way C code with PG_TRY and a subtransaction does.
+ * After the catch, a child span named after_name is started and ended.
+ * Everything happens inside this one call, so the spans stay LIFO with
+ * the C call stack even when other producers wrap each SQL statement in
+ * spans of their own.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_with_span_catch);
+Datum
+otel_api_conformance_with_span_catch(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	char	   *unwind_s = PG_ARGISNULL(2) ? "drop" : text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *after_name = PG_ARGISNULL(3) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(3));
+	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
+	MemoryContext oldcxt = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	OtelSpanRef s;
+	bool		caught = false;
+
+	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = unwind);
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcxt);
+	PG_TRY();
+	{
+		SPI_connect();
+		(void) SPI_execute(sql, false, 0);
+		SPI_finish();
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcxt);
+		CurrentResourceOwner = oldowner;
+		caught = true;
+	}
+	PG_END_TRY();
+
+	if (after_name != NULL)
+	{
+		OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = after_name,
+										.unwind = unwind);
+
+		otel_span_set_bool(a, "conformance.caught", caught);
+		otel_span_end(a);
+	}
+	otel_span_end(s);
+
+	PG_RETURN_INT64(s.v);
+}
+
+/* ----------------------------------------------------------------
+ * Interleaving scenarios (t/012).
+ * ---------------------------------------------------------------- */
+
+/*
+ * 100/300 detached spans chained by OTEL_PARENT_SPAN, ended in the
+ * given order.  Detached spans aren't subject to the LIFO stack rule
+ * at all, so every order below is legal; the point is to check that
+ * parent_span_id is recorded correctly regardless of end order.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_detached_chain);
+Datum
+otel_api_conformance_detached_chain(PG_FUNCTION_ARGS)
+{
+	int32		n = PG_GETARG_INT32(0);
+	char	   *order_mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int64		seed = PG_ARGISNULL(2) ? 42 : PG_GETARG_INT64(2);
+	OtelSpanRef *refs;
+	int		   *order;
+	pg_prng_state rnd;
+	OtelSpanRef prev = OTEL_SPAN_NONE;
+	int			i;
+
+	if (n <= 0)
+		PG_RETURN_VOID();
+
+	refs = palloc(sizeof(OtelSpanRef) * n);
+	order = palloc(sizeof(int) * n);
+
+	for (i = 0; i < n; i++)
+	{
+		char		namebuf[NAMEDATALEN];
+
+		snprintf(namebuf, sizeof(namebuf), "conformance.chain.%d", i);
+		refs[i] = otel_span_start(.tracer = &tracer_a, .name = namebuf,
+								   .parent = (i == 0) ? OTEL_PARENT_ACTIVE : OTEL_PARENT_SPAN,
+								   .parent_span = prev,
+								   .detached = true);
+		prev = refs[i];
+	}
+
+	for (i = 0; i < n; i++)
+		order[i] = i;
+
+	if (strcmp(order_mode, "reverse") == 0)
+	{
+		for (i = 0; i < n; i++)
+			order[i] = n - 1 - i;
+	}
+	else if (strcmp(order_mode, "random") == 0)
+	{
+		pg_prng_seed(&rnd, (uint64) seed);
+		for (i = n - 1; i > 0; i--)
+		{
+			int			j = (int) pg_prng_uint64_range(&rnd, 0, (uint64) i);
+			int			tmp = order[i];
+
+			order[i] = order[j];
+			order[j] = tmp;
+		}
+	}
+	else if (strcmp(order_mode, "forward") != 0)
+		ereport(ERROR,
+				(errmsg("otel_api_conformance_detached_chain: unknown order_mode \"%s\"",
+						order_mode)));
+
+	for (i = 0; i < n; i++)
+		otel_span_end(refs[order[i]]);
+
+	pfree(refs);
+	pfree(order);
+	PG_RETURN_VOID();
+}
+
+/*
+ * A stack span (parent) ends before its detached child; the child ends
+ * later and must still carry the parent's span_id.  Also: a further
+ * span started from the *saved context* of that now-ended parent (the
+ * context is plain data, captured before the parent ended; only the
+ * stale OtelSpanRef handle itself would be misuse).
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_parent_ends_first);
+Datum
+otel_api_conformance_parent_ends_first(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef parent = otel_span_start(.tracer = &tracer_a, .name = "conformance.b.parent");
+	OtelSpanRef child = otel_span_start(.tracer = &tracer_a, .name = "conformance.b.child",
+										 .parent = OTEL_PARENT_SPAN, .parent_span = parent,
+										 .detached = true);
+	OtelSpanContext parent_ctx;
+	bool		have_ctx = otel_span_context_of(parent, &parent_ctx);
+
+	otel_span_end(parent);		/* parent ends first */
+	otel_span_end(child);		/* detached child ends later; unaffected */
+
+	if (have_ctx)
+	{
+		OtelSpanRef grandchild = otel_span_start(.tracer = &tracer_a,
+												  .name = "conformance.b.from_ended_ctx",
+												  .parent = OTEL_PARENT_CONTEXT,
+												  .parent_ctx = &parent_ctx);
+
+		otel_span_end(grandchild);
+	}
+	PG_RETURN_VOID();
+}
+
+/*
+ * Stack span A; detached D child of A; stack span B child of A; end A
+ * while B is still open (non-LIFO).  In a cassert build this trips the
+ * same Assert as otel_api_conformance_misuse_non_lifo() (see
+ * t/008_misuse.pl) and the backend crashes before reaching the rest of
+ * this function; in other builds B is force-unwound under its own
+ * policy, A is emitted normally, and D (detached, never touched by the
+ * stack-unwind) ends fine afterwards.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_mixed_non_lifo_detached);
+Datum
+otel_api_conformance_mixed_non_lifo_detached(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.A",
+									 .unwind = OTEL_UNWIND_ERROR);
+	OtelSpanRef d = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.D",
+									 .parent = OTEL_PARENT_SPAN, .parent_span = a,
+									 .detached = true);
+	OtelSpanRef b = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.B",
+									 .unwind = OTEL_UNWIND_ERROR);
+
+	otel_span_end(a);			/* non-LIFO: B is still open above A */
+	otel_span_end(b);			/* stale handle: B was already force-unwound */
+	otel_span_end(d);			/* detached: unaffected, ends normally */
+	PG_RETURN_VOID();
+}
+
+/*
+ * Two producer scopes interleaving: A1 (stack), B1 (detached child of
+ * A1), A2 (stack child of A1, via the active stack), B2 (stack child
+ * of A2 structurally, but its *parent* is explicitly B1 -- a detached
+ * span of the other producer -- via OTEL_PARENT_SPAN).  Ended in LIFO
+ * stack order (B2, A2, A1), with B1 ended last to show detached order
+ * doesn't matter.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_two_producer_interleave);
+Datum
+otel_api_conformance_two_producer_interleave(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef a1 = otel_span_start(.tracer = &tracer_a, .name = "conformance.d.A1");
+	OtelSpanRef b1 = otel_span_start(.tracer = &tracer_b, .name = "conformance.d.B1",
+									  .parent = OTEL_PARENT_SPAN, .parent_span = a1,
+									  .detached = true);
+	OtelSpanRef a2 = otel_span_start(.tracer = &tracer_a, .name = "conformance.d.A2",
+									  .parent = OTEL_PARENT_ACTIVE);
+	OtelSpanRef b2 = otel_span_start(.tracer = &tracer_b, .name = "conformance.d.B2",
+									  .parent = OTEL_PARENT_SPAN, .parent_span = b1);
+
+	otel_span_end(b2);
+	otel_span_end(a2);
+	otel_span_end(a1);
+	otel_span_end(b1);
+	PG_RETURN_VOID();
+}
+
+/*
+ * One parent with n_children detached children open at once (the
+ * caller picks n_children near otel_api.max_open_spans), ended in a
+ * seeded random order; then n_over_limit further detached spans, to
+ * push past otel_api.max_open_spans and check the refusals are counted
+ * (start_no_slot) without disturbing anything already emitted.
+ * Returns {"refused_children": N, "refused_extra": M}.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_wide_fanout);
+Datum
+otel_api_conformance_wide_fanout(PG_FUNCTION_ARGS)
+{
+	int32		n_children = PG_GETARG_INT32(0);
+	int64		seed = PG_ARGISNULL(1) ? 7 : PG_GETARG_INT64(1);
+	int32		n_over_limit = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+	OtelSpanRef parent;
+	OtelSpanRef *children;
+	int		   *order;
+	pg_prng_state rnd;
+	int			i;
+	int32		refused_children = 0;
+	int32		refused_extra = 0;
+	StringInfoData buf;
+
+	parent = otel_span_start(.tracer = &tracer_a, .name = "conformance.e.parent");
+
+	children = palloc(sizeof(OtelSpanRef) * Max(n_children, 1));
+	order = palloc(sizeof(int) * Max(n_children, 1));
+	for (i = 0; i < n_children; i++)
+	{
+		char		namebuf[NAMEDATALEN];
+
+		snprintf(namebuf, sizeof(namebuf), "conformance.e.child.%d", i);
+		children[i] = otel_span_start(.tracer = &tracer_a, .name = namebuf,
+									   .parent = OTEL_PARENT_SPAN, .parent_span = parent,
+									   .detached = true);
+		if (children[i].v == 0)
+			refused_children++;
+		order[i] = i;
+	}
+
+	/*
+	 * While the parent + all n_children children are still open (near
+	 * otel_api.max_open_spans), try n_over_limit more, keeping every
+	 * successful one open too: this is the combined budget that
+	 * should be exhausted, not a fresh budget re-tested one span at a
+	 * time (which would never accumulate against the cap).
+	 */
+	{
+		OtelSpanRef *extras = palloc(sizeof(OtelSpanRef) * Max(n_over_limit, 1));
+		int			n_extras = 0;
+
+		for (i = 0; i < n_over_limit; i++)
+		{
+			OtelSpanRef extra = otel_span_start(.tracer = &tracer_a,
+												 .name = "conformance.e.overflow",
+												 .detached = true);
+
+			if (extra.v == 0)
+				refused_extra++;
+			else
+				extras[n_extras++] = extra;
+		}
+		for (i = 0; i < n_extras; i++)
+			otel_span_end(extras[i]);
+		pfree(extras);
+	}
+
+	pg_prng_seed(&rnd, (uint64) seed);
+	for (i = n_children - 1; i > 0; i--)
+	{
+		int			j = (int) pg_prng_uint64_range(&rnd, 0, (uint64) i);
+		int			tmp = order[i];
+
+		order[i] = order[j];
+		order[j] = tmp;
+	}
+	for (i = 0; i < n_children; i++)
+		otel_span_end(children[order[i]]);
+
+	otel_span_end(parent);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "{\"refused_children\":%d,\"refused_extra\":%d}",
+					  refused_children, refused_extra);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+}
+
+/* ----------------------------------------------------------------
+ * Randomised stress: a seeded walk over start/set/event/end/discard,
+ * tracking each recording span's own span_id and the span_id its
+ * creator *intended* as its parent, then cross-checking every emitted
+ * span's real parent_span_id against that intent.
+ *
+ * mode 'legal': every operation stays inside the rules (stack spans
+ * end LIFO via a maintained stack mirror; only genuinely still-live
+ * handles are ever named as a parent, ended, or discarded).  Runs on
+ * every build, and the parent-chain and accounting invariants below
+ * are asserted in full.
+ *
+ * mode 'illegal': the same generator, except "end" and "as a parent"
+ * targets are drawn from *every* op this run has ever created,
+ * including ones already ended or discarded -- reproducing stale-
+ * handle reuse, non-LIFO ends and dead handles used as
+ * OTEL_PARENT_SPAN without any special-casing.  This is a coarser
+ * check (no crash, backend clean afterwards, misuse counters moved),
+ * not a full parent-chain reconciliation: once an illegal op runs,
+ * this generator's own bookkeeping of "the" active stack no longer
+ * corresponds to otel_api's, by design.  Only run when
+ * debug_assertions is off (otel_api Asserts on exactly these cases).
+ * ---------------------------------------------------------------- */
+
+typedef struct StressOp
+{
+	OtelSpanRef ref;
+	bool		ended;
+	bool		discarded;
+	bool		detached;
+	bool		recording;
+	OtelSpanId	span_id;
+	OtelSpanId	expected_parent;
+	bool		expected_parent_is_root;
+} StressOp;
+
+static void
+stress_live_remove(int *live, int *n_live, int idx)
+{
+	int			i;
+
+	for (i = 0; i < *n_live; i++)
+	{
+		if (live[i] == idx)
+		{
+			live[i] = live[--(*n_live)];
+			return;
+		}
+	}
+}
+
+/*
+ * Remove idx from the stack mirror wherever it is, preserving the
+ * relative order of the rest (unlike stress_live_remove's swap-with-
+ * last): otel_span_discard() legitimately removes a span from any
+ * position in the middle of the stack, leaving the ones above it in
+ * place -- exactly what this mirrors.
+ */
+static void
+stack_mirror_remove(int *stack_mirror, int *stack_depth, int idx)
+{
+	int			i;
+
+	for (i = 0; i < *stack_depth; i++)
+	{
+		if (stack_mirror[i] == idx)
+		{
+			memmove(&stack_mirror[i], &stack_mirror[i + 1],
+					(*stack_depth - i - 1) * sizeof(int));
+			(*stack_depth)--;
+			return;
+		}
+	}
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_stress_ops);
+Datum
+otel_api_conformance_stress_ops(PG_FUNCTION_ARGS)
+{
+	int64		seed = PG_GETARG_INT64(0);
+	int32		n_ops = PG_GETARG_INT32(1);
+	char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(2));
+	bool		legal = (strcmp(mode, "legal") == 0);
+	pg_prng_state rnd;
+	StressOp   *ops;
+	int			n_alloc = 0;
+	int		   *live;			/* legal mode: genuinely-live op indices */
+	int			n_live = 0;
+	int		   *stack_mirror;	/* legal mode: non-detached live, in stack order */
+	int			stack_depth = 0;
+	int		   *detached_live_scratch;	/* legal mode: reused scratch for "end" target selection */
+	int64		n_started = 0,
+				n_ended = 0,
+				n_discarded = 0,
+				n_set_attr = 0,
+				n_events = 0;
+	int32		i;
+	int32		parent_checked = 0;
+	int32		parent_mismatches = 0;
+	OtelApiCounters c_before,
+				c_after;
+	const OtelInternalApi *ia = otel_internal_api();
+	StringInfoData buf;
+
+	if (!legal && strcmp(mode, "illegal") != 0)
+		ereport(ERROR, (errmsg("otel_api_conformance_stress_ops: unknown mode \"%s\"", mode)));
+	if (ia == NULL)
+		ereport(ERROR, (errmsg("otel_api_conformance: otel_api internal table is not available")));
+	if (n_ops <= 0)
+		ereport(ERROR, (errmsg("otel_api_conformance_stress_ops: n_ops must be positive")));
+
+	pg_prng_seed(&rnd, (uint64) seed);
+	ops = palloc0(sizeof(StressOp) * n_ops);
+	live = palloc(sizeof(int) * n_ops);
+	stack_mirror = palloc(sizeof(int) * n_ops);
+	detached_live_scratch = palloc(sizeof(int) * n_ops);
+
+	ia->get_counters(&c_before);
+
+	for (i = 0; i < n_ops; i++)
+	{
+		uint32		choice = pg_prng_uint32(&rnd) % 100;
+		/* Target pool for "end"/"discard"/"be a parent": in legal mode,
+		 * only genuinely-live ops; in illegal mode, every op ever made
+		 * (including dead ones), on purpose. */
+		int			pool_n = legal ? n_live : n_alloc;
+
+		if (choice < 55 || pool_n == 0)
+		{
+			/* start */
+			int			idx = n_alloc++;
+			StressOp   *op = &ops[idx];
+			uint32		pmode = pg_prng_uint32(&rnd) % 4;
+			bool		detached = pg_prng_bool(&rnd);
+			char		namebuf[NAMEDATALEN];
+			OtelTracer *tracer = pg_prng_bool(&rnd) ? &tracer_a : &tracer_b;
+
+			snprintf(namebuf, sizeof(namebuf), "conformance.stress.%d", idx);
+			op->expected_parent_is_root = true;
+			memset(&op->expected_parent, 0, sizeof(op->expected_parent));
+
+			if (pmode == 0 || pool_n == 0)
+			{
+				/* OTEL_PARENT_ACTIVE.  In legal mode the expected
+				 * parent is the top of our stack mirror (which we keep
+				 * in exact sync with otel_api's real one, since every
+				 * end/discard in legal mode is itself LIFO-legal).  In
+				 * illegal mode we don't track OTEL_PARENT_ACTIVE's
+				 * expected parent at all (our bookkeeping can't stay
+				 * in sync once a non-LIFO end has happened elsewhere),
+				 * so such spans are excluded from the parent check
+				 * below. */
+				if (legal && stack_depth > 0)
+				{
+					StressOp   *top = &ops[stack_mirror[stack_depth - 1]];
+
+					if (top->recording)
+					{
+						op->expected_parent = top->span_id;
+						op->expected_parent_is_root = false;
+					}
+				}
+				else if (!legal)
+					op->expected_parent_is_root = false;	/* unknown; skip check */
+				op->ref = otel_span_start(.tracer = tracer, .name = namebuf,
+										   .parent = OTEL_PARENT_ACTIVE,
+										   .detached = detached);
+			}
+			else if (pmode == 1)
+			{
+				int			pick;
+				StressOp   *p;
+
+				pick = legal ? live[pg_prng_uint64_range(&rnd, 0, n_live - 1)]
+					: (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+				p = &ops[pick];
+				if (p->recording)
+				{
+					op->expected_parent = p->span_id;
+					op->expected_parent_is_root = false;
+				}
+				else if (!legal)
+					op->expected_parent_is_root = false;	/* dead/unsampled; skip check */
+				op->ref = otel_span_start(.tracer = tracer, .name = namebuf,
+										   .parent = OTEL_PARENT_SPAN,
+										   .parent_span = p->ref,
+										   .detached = detached);
+			}
+			else if (pmode == 2)
+			{
+				int			pick = legal ? live[pg_prng_uint64_range(&rnd, 0, n_live - 1)]
+					: (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+				OtelSpanContext ctx;
+				bool		have_ctx = otel_span_context_of(ops[pick].ref, &ctx);
+
+				if (have_ctx)
+				{
+					op->expected_parent = ctx.span_id;
+					op->expected_parent_is_root = !otel_span_id_is_valid(&ctx.span_id);
+				}
+				else if (!legal)
+					op->expected_parent_is_root = false;	/* skip check */
+				op->ref = otel_span_start(.tracer = tracer, .name = namebuf,
+										   .parent = OTEL_PARENT_CONTEXT,
+										   .parent_ctx = have_ctx ? &ctx : NULL,
+										   .detached = detached);
+			}
+			else
+			{
+				/* OTEL_PARENT_ROOT: always a new trace. */
+				op->ref = otel_span_start(.tracer = tracer, .name = namebuf,
+										   .parent = OTEL_PARENT_ROOT,
+										   .detached = detached);
+			}
+
+			op->detached = detached;
+			op->recording = otel_span_recording(op->ref);
+			if (op->recording)
+			{
+				OtelSpanContext my_ctx;
+
+				if (otel_span_context_of(op->ref, &my_ctx))
+					op->span_id = my_ctx.span_id;
+				n_started++;
+			}
+			if (op->ref.v != 0)
+			{
+				live[n_live++] = idx;
+				if (!detached)
+					stack_mirror[stack_depth++] = idx;
+			}
+		}
+		else if (choice < 75)
+		{
+			int			pick = legal ? live[pg_prng_uint64_range(&rnd, 0, n_live - 1)]
+				: (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+
+			otel_span_set_int(ops[pick].ref, "conformance.stress.n", i);
+			n_set_attr++;
+		}
+		else if (choice < 85)
+		{
+			int			pick = legal ? live[pg_prng_uint64_range(&rnd, 0, n_live - 1)]
+				: (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+			OtelAttribute a = OTEL_ATTR_I64("conformance.stress.event_n", i);
+
+			otel_span_add_event(ops[pick].ref, "conformance.stress.event", 0, &a, 1);
+			n_events++;
+		}
+		else if (choice < 93)
+		{
+			/* end */
+			int			pick;
+
+			if (legal)
+			{
+				/*
+				 * Only the top of the stack mirror, or a live detached
+				 * handle, is a legal end target -- never an arbitrary
+				 * live[] entry, which may be a non-top stack member.
+				 * Collect the live detached candidates explicitly
+				 * (live[] mixes stack and detached indices).
+				 */
+				int			n_detached_live = 0;
+				int			k;
+
+				for (k = 0; k < n_live; k++)
+					if (ops[live[k]].detached)
+						detached_live_scratch[n_detached_live++] = live[k];
+
+				if (stack_depth > 0 && (n_detached_live == 0 || pg_prng_bool(&rnd)))
+					pick = stack_mirror[stack_depth - 1];
+				else if (n_detached_live > 0)
+					pick = detached_live_scratch[pg_prng_uint64_range(&rnd, 0, n_detached_live - 1)];
+				else
+					pick = stack_mirror[stack_depth - 1];
+			}
+			else
+				pick = (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+
+			otel_span_end(ops[pick].ref);
+			if (!ops[pick].ended && !ops[pick].discarded)
+				n_ended++;
+			ops[pick].ended = true;
+			if (legal)
+			{
+				stress_live_remove(live, &n_live, pick);
+				if (!ops[pick].detached && stack_depth > 0 &&
+					stack_mirror[stack_depth - 1] == pick)
+					stack_depth--;
+			}
+		}
+		else
+		{
+			/* discard */
+			int			pick = legal ? live[pg_prng_uint64_range(&rnd, 0, n_live - 1)]
+				: (int) pg_prng_uint64_range(&rnd, 0, n_alloc - 1);
+
+			otel_span_discard(ops[pick].ref);
+			if (!ops[pick].ended && !ops[pick].discarded)
+				n_discarded++;
+			ops[pick].discarded = true;
+			if (legal)
+			{
+				stress_live_remove(live, &n_live, pick);
+				if (!ops[pick].detached)
+					stack_mirror_remove(stack_mirror, &stack_depth, pick);
+			}
+		}
+	}
+
+	/* End everything still live: the stack mirror LIFO, then any
+	 * remaining detached handles. */
+	while (stack_depth > 0)
+	{
+		int			idx = stack_mirror[--stack_depth];
+
+		if (!ops[idx].ended && !ops[idx].discarded)
+		{
+			otel_span_end(ops[idx].ref);
+			ops[idx].ended = true;
+			n_ended++;
+		}
+	}
+	for (i = 0; i < n_live; i++)
+	{
+		int			idx = live[i];
+
+		if (!ops[idx].ended && !ops[idx].discarded)
+		{
+			otel_span_end(ops[idx].ref);
+			ops[idx].ended = true;
+			n_ended++;
+		}
+	}
+	if (!legal)
+	{
+		/* Illegal mode may have left handles neither in `live` nor on
+		 * the (unmaintained) stack mirror alive; sweep everything. */
+		for (i = 0; i < n_alloc; i++)
+			if (!ops[i].ended && !ops[i].discarded && ops[i].ref.v != 0)
+			{
+				otel_span_end(ops[i].ref);
+				ops[i].ended = true;
+			}
+	}
+
+	ia->get_counters(&c_after);
+
+	/*
+	 * Cross-check every emitted span whose creator intended a specific
+	 * parent (skips OTEL_SPAN_NONE creations and, in illegal mode, ops
+	 * whose intended parent we deliberately didn't track).
+	 */
+	for (i = 0; i < n_captured; i++)
+	{
+		int			j;
+
+		for (j = 0; j < n_alloc; j++)
+		{
+			if (!ops[j].recording)
+				continue;
+			if (!otel_span_id_equal(&ops[j].span_id, &captured[i].span_id))
+				continue;
+			if (ops[j].expected_parent_is_root)
+			{
+				if (otel_span_id_is_valid(&captured[i].parent_span_id))
+					parent_mismatches++;
+			}
+			else if (!otel_span_id_equal(&ops[j].expected_parent, &captured[i].parent_span_id))
+				parent_mismatches++;
+			parent_checked++;
+			break;
+		}
+	}
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					  "{\"mode\":");
+	append_json_string(&buf, mode);
+	appendStringInfo(&buf,
+					  ",\"n_ops\":%d"
+					  ",\"n_started\":" INT64_FORMAT
+					  ",\"n_ended\":" INT64_FORMAT
+					  ",\"n_discarded\":" INT64_FORMAT
+					  ",\"n_set_attr\":" INT64_FORMAT
+					  ",\"n_events\":" INT64_FORMAT
+					  ",\"parent_checked\":%d"
+					  ",\"parent_mismatches\":%d"
+					  ",\"stack_current_at_end\":" INT64_FORMAT
+					  ",\"spans_started_delta\":" UINT64_FORMAT
+					  ",\"spans_emitted_delta\":" UINT64_FORMAT
+					  ",\"spans_discarded_delta\":" UINT64_FORMAT
+					  ",\"stale_handle_delta\":" UINT64_FORMAT
+					  ",\"non_lifo_end_delta\":" UINT64_FORMAT
+					  ",\"unwound_error_delta\":" UINT64_FORMAT
+					  ",\"unwound_dropped_delta\":" UINT64_FORMAT
+					  "}",
+					  n_ops, n_started, n_ended, n_discarded, n_set_attr, n_events,
+					  parent_checked, parent_mismatches,
+					  otel_span_current().v,
+					  c_after.spans_started - c_before.spans_started,
+					  c_after.spans_emitted - c_before.spans_emitted,
+					  c_after.spans_discarded - c_before.spans_discarded,
+					  c_after.stale_handle - c_before.stale_handle,
+					  c_after.non_lifo_end - c_before.non_lifo_end,
+					  c_after.unwound_error - c_before.unwound_error,
+					  c_after.unwound_dropped - c_before.unwound_dropped);
+
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
 }
