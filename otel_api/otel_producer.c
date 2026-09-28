@@ -337,8 +337,14 @@ slot_grow(OtelSlot *slot, void **arr, int *cap, int want, Size elemsize,
 	return true;
 }
 
+static const char *
+stack_entry_name(int32 e)
+{
+	return e >= 0 ? slots[e].span.name : "(unsampled span)";
+}
+
 static void
-nonlifo_warning(const char *what)
+nonlifo_warning(const char *what, int pos)
 {
 	otel_counters.non_lifo_end++;
 	if (!non_lifo_warned)
@@ -346,8 +352,12 @@ nonlifo_warning(const char *what)
 		non_lifo_warned = true;
 		ereport(WARNING,
 				errmsg("otel_api: %s", what),
-				errdetail("Spans above it on the active stack were ended first. "
-						  "Further occurrences in this backend are only counted."));
+				errdetail("Ending \"%s\" at stack depth %d; \"%s\" is on top at depth %d. "
+						  "The spans above it were ended first. "
+						  "Further occurrences in this backend are only counted.",
+						  stack_entry_name(span_stack[pos]), pos + 1,
+						  stack_entry_name(span_stack[span_stack_depth - 1]),
+						  span_stack_depth));
 	}
 	Assert(false);				/* spans must end in LIFO order */
 }
@@ -1210,7 +1220,7 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 		{
 			if (pos != span_stack_depth - 1)
 			{
-				nonlifo_warning("unsampled span ended with spans still open above it");
+				nonlifo_warning("unsampled span ended with spans still open above it", pos);
 				stack_unwind_above(pos, "parent span ended first");
 			}
 			span_stack_depth--;
@@ -1236,7 +1246,7 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 		{
 			if (pos != span_stack_depth - 1)
 			{
-				nonlifo_warning("span ended with spans still open above it");
+				nonlifo_warning("span ended with spans still open above it", pos);
 				stack_unwind_above(pos, "parent span ended first");
 			}
 			span_stack_depth--;

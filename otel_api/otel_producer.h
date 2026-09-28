@@ -34,6 +34,12 @@
  *	 - Spans on the active stack should end in LIFO order.  Ending a span
  *	   with others above it ends those first (each under its own unwind
  *	   policy), with a WARNING, and fails an Assert in cassert builds.
+ *	 - So a span on the active stack must end within the call that started
+ *	   it (or a callee), not in a later SQL statement.  Other producers
+ *	   push spans of their own in between: otel_postgres_tracing wraps
+ *	   every statement, including each statement of a plpgsql function.
+ *	   A span that starts in one statement and ends in another must be
+ *	   .detached.
  *
  * Lifetime.  Every recording span belongs to a resource owner: by default
  * CurrentResourceOwner, or the one given in .owner.  When the owner is
