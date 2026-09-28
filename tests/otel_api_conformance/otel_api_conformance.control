@@ -1,0 +1,5 @@
+# otel_api_conformance extension
+comment = 'Conformance test extension/exporter/producer for otel_api MAJOR 3'
+default_version = '0.1'
+module_pathname = '$libdir/otel_api_conformance'
+relocatable = true
