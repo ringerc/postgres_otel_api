@@ -102,7 +102,7 @@ otel_internal_api(void)
 			: (const OtelInternalApi *) cache;
 	{
 		const OtelApi *api = otel_api_get();
-		const OtelInternalApi *i = api ? api->internal : NULL;
+		const OtelInternalApi *i = api ? (const OtelInternalApi *) api->internal : NULL;
 
 		if (i == NULL ||
 			!otel_api_table_ok("internal", i->version, i->struct_size,

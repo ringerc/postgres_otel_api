@@ -188,7 +188,7 @@ otel_exporter_api(void)
 			: (const OtelExporterApi *) cache;
 	{
 		const OtelApi *api = otel_api_get();
-		const OtelExporterApi *e = api ? api->exporter : NULL;
+		const OtelExporterApi *e = api ? (const OtelExporterApi *) api->exporter : NULL;
 
 		if (e == NULL ||
 			!otel_api_table_ok("exporter", e->version, e->struct_size,
@@ -233,7 +233,7 @@ otel_exporter_register_when_ready(OtelPendingRegistration *req)
 
 	if (api != NULL)
 	{
-		const OtelExporterApi *e = api->exporter;
+		const OtelExporterApi *e = (const OtelExporterApi *) api->exporter;
 
 		if (!otel_api_table_ok("root", api->version, api->struct_size,
 							   OTEL_ROOT_API_MAJOR, OTEL_ROOT_API_MINOR,

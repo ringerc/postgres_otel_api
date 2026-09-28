@@ -57,17 +57,20 @@
  */
 #define OTEL_API_RENDEZVOUS_NAME	"OtelApi.v3"
 
-typedef struct OtelProducerApi OtelProducerApi;
-typedef struct OtelExporterApi OtelExporterApi;
-typedef struct OtelInternalApi OtelInternalApi;
-
+/*
+ * The per-audience tables are defined in their own headers and reached
+ * through their accessors (otel_producer_api() etc.), which check each
+ * table's version and size.  They are untyped here: a typed pointer to a
+ * struct that is incomplete at this point makes bindgen generate an
+ * opaque type for it, even when the full definition is also visible.
+ */
 typedef struct OtelApi
 {
 	uint32		version;		/* OTEL_ROOT_API_VERSION */
 	uint32		struct_size;	/* sizeof(OtelApi) */
-	const OtelProducerApi *producer;
-	const OtelExporterApi *exporter;
-	const OtelInternalApi *internal;
+	const void *producer;		/* const OtelProducerApi * */
+	const void *exporter;		/* const OtelExporterApi * */
+	const void *internal;		/* const OtelInternalApi * */
 } OtelApi;
 
 /*

@@ -251,7 +251,7 @@ otel_producer_api(void)
 			: (const OtelProducerApi *) cache;
 	{
 		const OtelApi *api = otel_api_get();
-		const OtelProducerApi *p = api ? api->producer : NULL;
+		const OtelProducerApi *p = api ? (const OtelProducerApi *) api->producer : NULL;
 
 		if (p == NULL ||
 			!otel_api_table_ok("producer", p->version, p->struct_size,
