@@ -425,6 +425,10 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	if (MyProcPort == NULL && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
+	/* otel_api refuses every call inside a critical section. */
+	if (CritSectionCount > 0)
+		return;
+
 	/* ---- Classify the probe ---- */
 	is_start = false;
 	span_name = NULL;

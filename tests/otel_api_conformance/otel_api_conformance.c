@@ -784,7 +784,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"start_no_slot\":" UINT64_FORMAT ","
 					  "\"start_no_session_slot\":" UINT64_FORMAT ","
 					  "\"start_stack_full\":" UINT64_FORMAT ","
-					  "\"start_in_crit_section\":" UINT64_FORMAT ","
+					  "\"in_crit_section\":" UINT64_FORMAT ","
 					  "\"start_bad_args\":" UINT64_FORMAT ","
 					  "\"stale_handle\":" UINT64_FORMAT ","
 					  "\"non_lifo_end\":" UINT64_FORMAT ","
@@ -803,7 +803,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "}",
 					  c.spans_started, c.spans_unsampled, c.spans_emitted, c.spans_discarded,
 					  c.start_no_slot, c.start_no_session_slot, c.start_stack_full,
-					  c.start_in_crit_section, c.start_bad_args,
+					  c.in_crit_section, c.start_bad_args,
 					  c.stale_handle, c.non_lifo_end, c.unwound,
 					  c.leaked_at_commit, c.open_at_exit,
 					  c.attr_truncated, c.attr_dropped, c.event_dropped, c.link_dropped,
@@ -1695,6 +1695,82 @@ misuse_scoped_nest(int depth)
 	if (depth <= 0)
 		return misuse_scoped_start_deep();
 	return misuse_scoped_nest(depth - 1);
+}
+
+/*
+ * Start a recording span, run one producer call on it inside a critical
+ * section, then end it.  Every call there must be refused: cassert builds
+ * Assert, other builds leave the span unchanged.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_misuse_crit_section_op);
+Datum
+otel_api_conformance_misuse_crit_section_op(PG_FUNCTION_ARGS)
+{
+	const char *op = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	OtelSpanRef s = otel_span_start(.tracer = &tracer_a,
+									.name = "conformance.misuse.crit_op");
+	OtelSpanRef cur = OTEL_SPAN_NONE;
+	OtelSpanContext ctx;
+	OtelAttribute attr = OTEL_ATTR_STR("conformance.crit", "set");
+	ErrorData	edata = {.elevel = ERROR,
+		.sqlerrcode = ERRCODE_DIVISION_BY_ZERO,
+	.message = "conformance crit section"};
+	bool		got_ctx = false;
+	bool		known = true;
+
+	if (s.v <= 0)
+		elog(ERROR, "could not start a recording span");
+	memset(&ctx, 0, sizeof(ctx));
+	otel_span_context_of(s, &ctx);
+
+	START_CRIT_SECTION();
+	if (strcmp(op, "end") == 0)
+		otel_span_end(s);
+	else if (strcmp(op, "discard") == 0)
+		otel_span_discard(s);
+	else if (strcmp(op, "set_str") == 0)
+		otel_span_set_str(s, "conformance.crit", "set");
+	else if (strcmp(op, "set_int") == 0)
+		otel_span_set_int(s, "conformance.crit", 1);
+	else if (strcmp(op, "set_double") == 0)
+		otel_span_set_double(s, "conformance.crit", 1.0);
+	else if (strcmp(op, "set_bool") == 0)
+		otel_span_set_bool(s, "conformance.crit", true);
+	else if (strcmp(op, "set_printf") == 0)
+		otel_span_set_printf(s, "conformance.crit", "%d", 1);
+	else if (strcmp(op, "set_name") == 0)
+		otel_span_set_name(s, "conformance.misuse.crit_op.renamed");
+	else if (strcmp(op, "set_status") == 0)
+		otel_span_set_status(s, OTEL_STATUS_ERROR, "conformance crit section");
+	else if (strcmp(op, "add_event") == 0)
+		otel_span_add_event(s, "conformance.crit", 0, &attr, 1);
+	else if (strcmp(op, "add_link") == 0)
+		otel_span_add_link(s, &ctx);
+	else if (strcmp(op, "record_error") == 0)
+		otel_span_record_error(s, &edata);
+	else if (strcmp(op, "capture_error") == 0)
+		otel_span_capture_error(s);
+	else if (strcmp(op, "current") == 0)
+		cur = otel_span_current();
+	else if (strcmp(op, "context_of") == 0)
+		got_ctx = otel_span_context_of(s, &ctx);
+	else if (strcmp(op, "resource_add") == 0)
+		otel_resource_add("conformance.crit", "set");
+	else
+		known = false;
+	END_CRIT_SECTION();
+
+	if (!known)
+		elog(ERROR, "unknown op \"%s\"", op);
+	if (cur.v != 0)
+		elog(ERROR, "otel_span_current() returned a span inside a critical section");
+	if (got_ctx)
+		elog(ERROR, "otel_span_context_of() succeeded inside a critical section");
+
+	/* Still open and usable after the critical section. */
+	otel_span_set_str(s, "conformance.after_crit", "set");
+	otel_span_end(s);
+	PG_RETURN_VOID();
 }
 
 PG_FUNCTION_INFO_V1(otel_api_conformance_misuse_scoped_leak);

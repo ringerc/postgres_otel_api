@@ -122,7 +122,42 @@ check_misuse('non-LIFO end',
 
 check_misuse('call in a critical section',
 	'SELECT otel_api_conformance_misuse_critical_section()',
-	'start_in_crit_section');
+	'in_crit_section');
+
+# Every other producer call, made inside a critical section on a span
+# opened before it.  The span must come out unchanged and still usable.
+my @crit_ops = qw(end discard set_str set_int set_double set_bool set_printf
+  set_name set_status add_event add_link record_error capture_error
+  current context_of resource_add);
+for my $op (@crit_ops)
+{
+	check_misuse("$op in a critical section",
+		"SELECT otel_api_conformance_misuse_crit_section_op('$op')",
+		'in_crit_section');
+
+	next if $cassert eq 'on';
+
+	my $out = $node->safe_psql('postgres', <<SQL);
+SELECT otel_api_conformance_reset() AS r \\gset
+SELECT otel_api_conformance_misuse_crit_section_op('$op') AS r2 \\gset
+SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s WHERE s->>'name' LIKE 'conformance.misuse.crit_op%';
+SELECT otel_api_conformance_counters();
+SQL
+	my @lines = split /\n/, $out;
+	my @spans = @{ decode_json($lines[0] || "[]") };
+	my $c = decode_json($lines[1]);
+	is($c->{in_crit_section}, 1, "$op in a critical section: counted once");
+	is(scalar(@spans), 1, "$op in a critical section: the span is exported once, after the critical section");
+	my $sp = $spans[0] or next;
+	is($sp->{name}, 'conformance.misuse.crit_op', "$op in a critical section: name unchanged");
+	is($sp->{status}, 0, "$op in a critical section: status unchanged");
+	is(scalar(@{ $sp->{events} }), 0, "$op in a critical section: no event added");
+	is(scalar(@{ $sp->{links} }), 0, "$op in a critical section: no link added");
+	ok(!(grep { $_->{key} eq 'conformance.crit' } @{ $sp->{attrs} }),
+		"$op in a critical section: no attribute added");
+	ok((grep { $_->{key} eq 'conformance.after_crit' } @{ $sp->{attrs} }),
+		"$op in a critical section: the span is usable after the critical section");
+}
 
 check_misuse('.scoped span whose frame returned',
 	'SELECT otel_api_conformance_misuse_scoped_leak()',

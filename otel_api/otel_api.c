@@ -137,7 +137,7 @@ otel_commit_trace_context_cb(xl_xact_trace_context *tc)
 {
 	OtelSpanContext ctx;
 
-	if (!otel_producer_api_table.span_context_of(OTEL_SPAN_NONE, &ctx) ||
+	if (!otel_span_context_of_internal(OTEL_SPAN_NONE, &ctx) ||
 		!otel_span_context_sampled(&ctx))
 		return false;
 	StaticAssertStmt(sizeof(tc->trace_id) == OTEL_TRACE_ID_BYTES &&

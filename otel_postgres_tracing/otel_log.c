@@ -34,6 +34,7 @@
 #include "postgres.h"
 
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -75,7 +76,8 @@ otel_emit_log_hook(ErrorData *edata)
 {
 	OtelSpanContext ctx;
 
-	if (otel_span_context_of(OTEL_SPAN_NONE, &ctx))
+	/* otel_api refuses every call inside a critical section. */
+	if (CritSectionCount == 0 && otel_span_context_of(OTEL_SPAN_NONE, &ctx))
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(edata->assoc_context);
 		char		trace_id_hex[OTEL_TRACE_ID_HEX_LEN + 1];

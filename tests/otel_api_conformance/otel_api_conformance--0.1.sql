@@ -262,6 +262,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_misuse_critical_section'
 LANGUAGE C VOLATILE;
 
+CREATE FUNCTION otel_api_conformance_misuse_crit_section_op(op text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_misuse_crit_section_op'
+LANGUAGE C VOLATILE;
+
 CREATE FUNCTION otel_api_conformance_misuse_scoped_leak()
 RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_misuse_scoped_leak'

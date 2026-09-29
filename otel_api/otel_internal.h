@@ -58,5 +58,6 @@ extern const OtelProducerApi otel_producer_api_table;
 extern OtelApiCounters otel_counters;
 extern void otel_producer_init(void);
 extern void otel_emit_span_as_log_line(const OtelSpan *span);
+extern bool otel_span_context_of_internal(OtelSpanRef s, OtelSpanContext *out);
 
 #endif							/* OTEL_API_INTERNAL_H */

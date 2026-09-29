@@ -1030,6 +1030,20 @@ start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
 
 static void nrec_context(OtelNrec *n, OtelSpanContext *out);
 
+/*
+ * No producer call may run inside a critical section.  cassert builds fail
+ * the Assert; other builds count the call and do nothing.
+ */
+static inline bool
+in_crit_section(void)
+{
+	Assert(CritSectionCount == 0);
+	if (likely(CritSectionCount == 0))
+		return false;
+	otel_counters.in_crit_section++;
+	return true;
+}
+
 static OtelSpanRef
 api_span_start(const OtelSpanStartArgs *args)
 {
@@ -1043,12 +1057,8 @@ api_span_start(const OtelSpanStartArgs *args)
 	OtelSlot   *slot;
 	OtelSpanRef ref;
 
-	Assert(CritSectionCount == 0);
-	if (unlikely(CritSectionCount > 0))
-	{
-		otel_counters.start_in_crit_section++;
+	if (in_crit_section())
 		return OTEL_SPAN_NONE;
-	}
 	if (args == NULL || args->struct_size < sizeof(OtelSpanStartArgs) ||
 		args->name == NULL)
 	{
@@ -1216,8 +1226,7 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 {
 	int			pos;
 
-	Assert(CritSectionCount == 0);
-	if (unlikely(CritSectionCount > 0) || s.v == 0)
+	if (in_crit_section() || s.v == 0)
 		return;
 	check_scoped_frames();
 
@@ -1299,8 +1308,7 @@ setter_slot(OtelSpanRef s)
 {
 	OtelSlot   *slot;
 
-	Assert(CritSectionCount == 0);
-	if (unlikely(CritSectionCount > 0) || s.v <= 0)
+	if (in_crit_section() || s.v <= 0)
 		return NULL;
 	slot = slot_for_ref(s);
 	if (slot != NULL && slot->dispatching)
@@ -1546,7 +1554,7 @@ api_span_current(void)
 {
 	int32		e;
 
-	if (span_stack_depth == 0)
+	if (in_crit_section() || span_stack_depth == 0)
 		return OTEL_SPAN_NONE;
 	e = span_stack[span_stack_depth - 1];
 	if (e >= 0)
@@ -1566,8 +1574,13 @@ nrec_context(OtelNrec *n, OtelSpanContext *out)
 	*out = n->ctx;
 }
 
-static bool
-api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
+/*
+ * otel_span_context_of() without the critical-section check, for
+ * otel_api's own commit-record hook, which core calls inside
+ * RecordTransactionCommit's critical section.  Allocates nothing.
+ */
+bool
+otel_span_context_of_internal(OtelSpanRef s, OtelSpanContext *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (s.v == 0)
@@ -1613,13 +1626,31 @@ api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
 	}
 }
 
+static bool
+api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
+{
+	if (in_crit_section())
+	{
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return otel_span_context_of_internal(s, out);
+}
+
+static void
+api_resource_add(const char *key, const char *value)
+{
+	if (in_crit_section())
+		return;
+	otel_resource_attr_add(key, value);
+}
+
 static void
 api_span_discard(OtelSpanRef s)
 {
 	int			pos;
 
-	Assert(CritSectionCount == 0);
-	if (unlikely(CritSectionCount > 0) || s.v == 0)
+	if (in_crit_section() || s.v == 0)
 		return;
 	if (s.v < 0)
 	{
@@ -1663,7 +1694,7 @@ const OtelProducerApi otel_producer_api_table = {
 	.span_record_error = api_span_record_error,
 	.span_current = api_span_current,
 	.span_context_of = api_span_context_of,
-	.resource_add = otel_resource_attr_add,
+	.resource_add = api_resource_add,
 	.span_discard = api_span_discard,
 };
 
@@ -1787,7 +1818,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 #define F(f) {#f, offsetof(OtelApiCounters, f)}
 		F(spans_started), F(spans_unsampled), F(spans_emitted), F(spans_discarded),
 		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
-		F(start_in_crit_section), F(start_bad_args),
+		F(in_crit_section), F(start_bad_args),
 		F(stale_handle), F(non_lifo_end), F(unwound),
 		F(leaked_at_commit), F(open_at_exit),
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),

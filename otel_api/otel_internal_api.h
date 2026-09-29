@@ -47,9 +47,9 @@ typedef struct OtelApiCounters
 	uint64		start_no_slot;		/* otel_api.max_open_spans reached */
 	uint64		start_no_session_slot;	/* otel_api.max_session_spans reached */
 	uint64		start_stack_full;	/* active stack depth limit */
-	uint64		start_in_crit_section;
 	uint64		start_bad_args;		/* no name, bad struct_size, stale parent */
 
+	uint64		in_crit_section;	/* any producer call, refused */
 	uint64		stale_handle;		/* used after end, or foreign */
 	uint64		non_lifo_end;		/* spans ended out of stack order */
 	uint64		unwound;			/* ended by owner release or by an enclosing
