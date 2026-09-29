@@ -56,6 +56,7 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -279,9 +280,60 @@ nrec_for_ref(OtelSpanRef s)
 	return NULL;
 }
 
+/*
+ * Test-only allocation-failure injection: compiles to a no-op / always
+ * false without USE_INJECTION_POINTS (INJECTION_POINT() is a macro that
+ * expands to nothing in that case; see utils/injection_point.h).  With
+ * it, tests/otel_api_conformance can arm one of the named sites below
+ * for the current backend so the next allocation at that site behaves
+ * exactly as if MCXT_ALLOC_NO_OOM (or repalloc_extended/ResourceOwner-
+ * Enlarge/otel_tracer_register) had failed -- otel_api's own code takes
+ * the same NULL/ERROR path it would on a real OOM.
+ *
+ * Site names (each is "otel-api-oom-<site>"):
+ *   pool             ensure_pool's slots array
+ *   name             a span's name (start, or otel_span_set_name)
+ *   tracestate       a copied parent tracestate
+ *   attr-key         an attribute (or event-attribute) key
+ *   attr-value       an attribute (or event-attribute) value
+ *   event-name       an event's name
+ *   status-description  a span's status description (auto or user-set)
+ *   error-message    a captured error's message
+ *   error-detail     a captured error's detail
+ *   error-hint       a captured error's hint
+ *   error-filename   a captured error's source file name
+ *   error-funcname   a captured error's source function name
+ *   attrs            growing the attributes array
+ *   events           growing the events array
+ *   links            growing the links array
+ *   exception-attrs  the "exception" event's attribute array
+ *   event-attrs      an event's attribute-array copy (otel_span_add_event)
+ *   vprintf          the oversized buffer in otel_span_set_vprintf
+ *
+ * Three more sites precede a call that can raise ERROR on a real OOM,
+ * armed the same way but with the callback itself doing the ereport
+ * (see tests/otel_api_conformance's injection callback):
+ *   resowner-enlarge  ResourceOwnerEnlarge() in otel_span_start()
+ *   slot-context      a slot's first AllocSetContextCreate() (take_slot)
+ *   tracer-register   otel_tracer_register() in otel_span_start()
+ *
+ * No site sits on a path reachable from a critical section: otel_api's
+ * own use of otel_span_context_of_internal() (from a commit-time trace-
+ * context callback) allocates nothing on any of its paths.
+ */
+static inline bool
+otel_inject_fail(const char *site)
+{
+	bool		fail = false;
+
+	INJECTION_POINT(site, &fail);
+	return fail;
+}
+
 /* Copy up to maxlen bytes of str, clipped at a character boundary. */
 static char *
-slot_strdup(OtelSlot *slot, const char *str, int maxlen, bool *truncated)
+slot_strdup(OtelSlot *slot, const char *str, int maxlen, bool *truncated,
+			const char *site)
 {
 	size_t		len = strlen(str);
 	char	   *copy;
@@ -296,6 +348,8 @@ slot_strdup(OtelSlot *slot, const char *str, int maxlen, bool *truncated)
 	}
 	if (slot->bytes + len + 1 > (Size) otel_max_span_bytes)
 		return NULL;
+	if (otel_inject_fail(site))
+		return NULL;
 	copy = MemoryContextAllocExtended(slot->cxt, len + 1, MCXT_ALLOC_NO_OOM);
 	if (copy == NULL)
 		return NULL;
@@ -308,7 +362,7 @@ slot_strdup(OtelSlot *slot, const char *str, int maxlen, bool *truncated)
 /* Grow an array in the slot's context to hold at least want elements. */
 static bool
 slot_grow(OtelSlot *slot, void **arr, int *cap, int want, Size elemsize,
-		  void *inline_arr)
+		  void *inline_arr, const char *site)
 {
 	int			newcap;
 	void	   *newarr;
@@ -318,6 +372,8 @@ slot_grow(OtelSlot *slot, void **arr, int *cap, int want, Size elemsize,
 	newcap = Max(want, *cap * 2);
 	newcap = Max(newcap, 4);
 	if (slot->bytes + (Size) (newcap - *cap) * elemsize > (Size) otel_max_span_bytes)
+		return false;
+	if (otel_inject_fail(site))
 		return false;
 	if (*arr == NULL || *arr == inline_arr)
 	{
@@ -571,6 +627,8 @@ ensure_pool(void)
 	span_pool_cxt = AllocSetContextCreate(TopMemoryContext, "otel_api span pool",
 										  ALLOCSET_SMALL_SIZES);
 	nslots = otel_max_open_spans;
+	if (otel_inject_fail("otel-api-oom-pool"))
+		return false;
 	/* Not zeroed: slots are initialised when first handed out. */
 	slots = MemoryContextAllocExtended(span_pool_cxt, sizeof(OtelSlot) * nslots,
 									   MCXT_ALLOC_NO_OOM | MCXT_ALLOC_HUGE);
@@ -603,6 +661,7 @@ take_slot(void)
 		/* Can raise ERROR on OOM; the slot is still free if it does. */
 		PG_TRY();
 		{
+			INJECTION_POINT("otel-api-oom-slot-context", NULL);
 			slot->cxt = AllocSetContextCreate(span_pool_cxt, "otel_api span",
 											  ALLOCSET_SMALL_SIZES);
 		}
@@ -667,16 +726,21 @@ slot_record_error(OtelSlot *slot, const ErrorData *edata)
 	if (!oom)
 	{
 		if (edata->message)
-			err->message = slot_strdup(slot, edata->message, otel_attr_value_max, NULL);
+			err->message = slot_strdup(slot, edata->message, otel_attr_value_max, NULL,
+										"otel-api-oom-error-message");
 		if (edata->detail)
-			err->detail = slot_strdup(slot, edata->detail, otel_attr_value_max, NULL);
+			err->detail = slot_strdup(slot, edata->detail, otel_attr_value_max, NULL,
+									  "otel-api-oom-error-detail");
 		if (edata->hint)
-			err->hint = slot_strdup(slot, edata->hint, otel_attr_value_max, NULL);
+			err->hint = slot_strdup(slot, edata->hint, otel_attr_value_max, NULL,
+									"otel-api-oom-error-hint");
 		/* May point into JIT code unloaded at transaction end: copy. */
 		if (edata->filename)
-			err->filename = slot_strdup(slot, edata->filename, -1, NULL);
+			err->filename = slot_strdup(slot, edata->filename, -1, NULL,
+										"otel-api-oom-error-filename");
 		if (edata->funcname)
-			err->funcname = slot_strdup(slot, edata->funcname, -1, NULL);
+			err->funcname = slot_strdup(slot, edata->funcname, -1, NULL,
+										"otel-api-oom-error-funcname");
 		if ((edata->message && !err->message) || (edata->detail && !err->detail) ||
 			(edata->hint && !err->hint))
 			otel_counters.error_capture_failed++;
@@ -695,7 +759,11 @@ slot_record_error(OtelSlot *slot, const ErrorData *edata)
 static const char *
 error_description(OtelSlot *slot, const char *sqlstate, const char *message)
 {
-	char	   *buf = MemoryContextAllocExtended(slot->cxt, 256, MCXT_ALLOC_NO_OOM);
+	char	   *buf;
+
+	if (otel_inject_fail("otel-api-oom-status-description"))
+		return NULL;
+	buf = MemoryContextAllocExtended(slot->cxt, 256, MCXT_ALLOC_NO_OOM);
 
 	if (buf)
 	{
@@ -788,10 +856,11 @@ lower_error_event(OtelSlot *slot)
 
 	/* The strings are already in the slot's context: store, don't copy. */
 	if (slot_grow(slot, (void **) &slot->events, &slot->events_cap,
-				  slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL))
+				  slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL,
+				  "otel-api-oom-events"))
 	{
-		OtelAttribute *attrs = MemoryContextAllocExtended(slot->cxt, sizeof(a[0]) * n,
-														  MCXT_ALLOC_NO_OOM);
+		OtelAttribute *attrs = otel_inject_fail("otel-api-oom-exception-attrs") ? NULL :
+			MemoryContextAllocExtended(slot->cxt, sizeof(a[0]) * n, MCXT_ALLOC_NO_OOM);
 
 		ev = &slot->events[slot->span.n_events++];
 		ev->name = OTEL_SC_EXCEPTION_EVENT;
@@ -1153,11 +1222,17 @@ api_span_start(const OtelSpanStartArgs *args)
 	}
 	/* These can raise ERROR on OOM; nothing to undo yet. */
 	if (args->tracer != NULL && args->tracer->scope == NULL && args->tracer->name != NULL)
+	{
+		INJECTION_POINT("otel-api-oom-tracer-register", NULL);
 		args->tracer->scope = otel_tracer_register(args->tracer->name,
 												   args->tracer->version,
 												   args->tracer->schema_url);
+	}
 	if (owner != NULL)
+	{
+		INJECTION_POINT("otel-api-oom-resowner-enlarge", NULL);
 		ResourceOwnerEnlarge(owner);
+	}
 	idx = take_slot();
 	if (idx < 0)
 	{
@@ -1186,18 +1261,21 @@ api_span_start(const OtelSpanStartArgs *args)
 	{
 		slot->span.parent_span_id = slots[p.idx].span.span_id;
 		if (slots[p.idx].span.tracestate)
-			slot->span.tracestate = slot_strdup(slot, slots[p.idx].span.tracestate, -1, NULL);
+			slot->span.tracestate = slot_strdup(slot, slots[p.idx].span.tracestate, -1, NULL,
+												"otel-api-oom-tracestate");
 	}
 	else if (p.kind == PARENT_REMOTE)
 	{
 		slot->span.parent_span_id = p.ctx.span_id;
 		if (p.ctx.tracestate)
-			slot->span.tracestate = slot_strdup(slot, p.ctx.tracestate, -1, NULL);
+			slot->span.tracestate = slot_strdup(slot, p.ctx.tracestate, -1, NULL,
+												"otel-api-oom-tracestate");
 	}
 	slot->span.trace_flags = (parent_flags & ~OTEL_TRACE_FLAG_SAMPLED) |
 		(decision == OTEL_SAMPLE_RECORD_AND_SAMPLE ? OTEL_TRACE_FLAG_SAMPLED : 0);
 	slot->span.sampler_decision = decision;
-	slot->span.name = slot_strdup(slot, args->name, otel_attr_value_max, NULL);
+	slot->span.name = slot_strdup(slot, args->name, otel_attr_value_max, NULL,
+								  "otel-api-oom-name");
 	if (slot->span.name == NULL)
 		slot->span.name = "(out of memory)";
 	slot->span.start_time = args->start_time ? args->start_time : GetCurrentTimestamp();
@@ -1289,8 +1367,9 @@ slot_attr(OtelSlot *slot, const char *key)
 			return &slot->attrs[i];
 
 	if (!slot_grow(slot, (void **) &slot->attrs, &slot->attrs_cap,
-				   slot->span.n_attrs + 1, sizeof(OtelAttribute), slot->inline_attrs) ||
-		(k = slot_strdup(slot, key, -1, NULL)) == NULL)
+				   slot->span.n_attrs + 1, sizeof(OtelAttribute), slot->inline_attrs,
+				   "otel-api-oom-attrs") ||
+		(k = slot_strdup(slot, key, -1, NULL, "otel-api-oom-attr-key")) == NULL)
 	{
 		slot->span.dropped_attrs++;
 		otel_counters.attr_dropped++;
@@ -1325,7 +1404,7 @@ set_str_internal(OtelSlot *slot, const char *key, const char *val)
 
 	if (val == NULL || (a = slot_attr(slot, key)) == NULL)
 		return;
-	copy = slot_strdup(slot, val, otel_attr_value_max, &truncated);
+	copy = slot_strdup(slot, val, otel_attr_value_max, &truncated, "otel-api-oom-attr-value");
 	if (copy == NULL)
 	{
 		/* Keep the key, drop the value: remove the entry again. */
@@ -1406,7 +1485,8 @@ api_span_set_vprintf(OtelSpanRef s, const char *key, const char *fmt, va_list ap
 	if (len >= (int) sizeof(buf) && otel_attr_value_max >= (int) sizeof(buf))
 	{
 		/* Longer than the buffer, and attr_value_max allows more. */
-		char	   *big = MemoryContextAllocExtended(slot->cxt, len + 1, MCXT_ALLOC_NO_OOM);
+		char	   *big = otel_inject_fail("otel-api-oom-vprintf") ? NULL :
+			MemoryContextAllocExtended(slot->cxt, len + 1, MCXT_ALLOC_NO_OOM);
 
 		if (big != NULL)
 		{
@@ -1429,7 +1509,8 @@ api_span_set_name(OtelSpanRef s, const char *name)
 	OtelSlot   *slot = setter_slot(s);
 	char	   *copy;
 
-	if (slot && name && (copy = slot_strdup(slot, name, otel_attr_value_max, NULL)) != NULL)
+	if (slot && name &&
+		(copy = slot_strdup(slot, name, otel_attr_value_max, NULL, "otel-api-oom-name")) != NULL)
 		slot->span.name = copy;
 }
 
@@ -1442,7 +1523,8 @@ api_span_set_status(OtelSpanRef s, OtelSpanStatus code, const char *description)
 		return;
 	slot->span.status = code;
 	slot->span.status_description = description
-		? slot_strdup(slot, description, otel_attr_value_max, NULL) : NULL;
+		? slot_strdup(slot, description, otel_attr_value_max, NULL,
+					  "otel-api-oom-status-description") : NULL;
 }
 
 static void
@@ -1457,23 +1539,27 @@ api_span_add_event(OtelSpanRef s, const char *name, TimestampTz ts,
 	if (slot == NULL || name == NULL)
 		return;
 	if (!slot_grow(slot, (void **) &slot->events, &slot->events_cap,
-				   slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL) ||
-		(ename = slot_strdup(slot, name, otel_attr_value_max, NULL)) == NULL)
+				   slot->span.n_events + 1, sizeof(OtelSpanEvent), NULL,
+				   "otel-api-oom-events") ||
+		(ename = slot_strdup(slot, name, otel_attr_value_max, NULL,
+							 "otel-api-oom-event-name")) == NULL)
 		goto dropped;
 	if (n_attrs > 0)
 	{
 		Size		sz = sizeof(OtelAttribute) * n_attrs;
 
 		if (slot->bytes + sz > (Size) otel_max_span_bytes ||
+			otel_inject_fail("otel-api-oom-event-attrs") ||
 			(copy = MemoryContextAllocExtended(slot->cxt, sz, MCXT_ALLOC_NO_OOM)) == NULL)
 			goto dropped;
 		slot->bytes += sz;
 		for (int i = 0; i < n_attrs; i++)
 		{
 			copy[i] = attrs[i];
-			copy[i].key = slot_strdup(slot, attrs[i].key, -1, NULL);
+			copy[i].key = slot_strdup(slot, attrs[i].key, -1, NULL, "otel-api-oom-attr-key");
 			if (attrs[i].type == OTEL_ATTR_STRING && attrs[i].v.s)
-				copy[i].v.s = slot_strdup(slot, attrs[i].v.s, otel_attr_value_max, NULL);
+				copy[i].v.s = slot_strdup(slot, attrs[i].v.s, otel_attr_value_max, NULL,
+										  "otel-api-oom-attr-value");
 			if (copy[i].key == NULL ||
 				(attrs[i].type == OTEL_ATTR_STRING && attrs[i].v.s && copy[i].v.s == NULL))
 				goto dropped;
@@ -1500,7 +1586,8 @@ api_span_add_link(OtelSpanRef s, const OtelSpanContext *target)
 	if (slot == NULL || target == NULL || !otel_span_context_is_valid(target))
 		return;
 	if (!slot_grow(slot, (void **) &slot->links, &slot->links_cap,
-				   slot->span.n_links + 1, sizeof(OtelSpanContext), NULL))
+				   slot->span.n_links + 1, sizeof(OtelSpanContext), NULL,
+				   "otel-api-oom-links"))
 	{
 		slot->span.dropped_links++;
 		otel_counters.link_dropped++;

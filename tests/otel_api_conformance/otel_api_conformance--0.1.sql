@@ -150,6 +150,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_record_error_scenario'
 LANGUAGE C VOLATILE STRICT;
 
+CREATE FUNCTION otel_api_conformance_record_error_full_scenario(name text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_record_error_full_scenario'
+LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION otel_api_conformance_start_and_ereport(name text, elevel text)
 RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_start_and_ereport'
@@ -354,4 +359,67 @@ LANGUAGE C VOLATILE STRICT;
 CREATE FUNCTION otel_api_conformance_abort_hook_reset()
 RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_abort_hook_reset'
+LANGUAGE C VOLATILE STRICT;
+
+-- ----------------------------------------------------------------
+-- Exporter misbehaviour during dispatch (t/017).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION otel_api_conformance_set_emit_misbehaviour(mode text, match_name text DEFAULT NULL)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_set_emit_misbehaviour'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION otel_api_conformance_set_misbehaviour_ref(ref bigint)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_set_misbehaviour_ref'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_misbehaviour_status()
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_misbehaviour_status'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_misbehaviour_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_misbehaviour_reset'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_holdoff_counts()
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_holdoff_counts'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_dispatch_error_probe(hold_interrupts boolean DEFAULT false)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_dispatch_error_probe'
+LANGUAGE C VOLATILE STRICT;
+
+-- ----------------------------------------------------------------
+-- Real out-of-memory paths via injection points (t/018, postgres-cdq.9.2).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION otel_api_conformance_oom_available()
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'otel_api_conformance_oom_available'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_oom_arm(site text, skip integer DEFAULT 0, fail_count integer DEFAULT 1)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_oom_arm'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_oom_disarm(site text)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_oom_disarm'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_oom_status(site text)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_oom_status'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_oom_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_oom_reset'
 LANGUAGE C VOLATILE STRICT;

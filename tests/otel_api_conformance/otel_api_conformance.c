@@ -86,6 +86,11 @@ extern Datum jsonb_in(PG_FUNCTION_ARGS);
 void		_PG_init(void);
 extern void otel_api_conformance_stub_check(void);
 pg_noreturn extern PGDLLEXPORT void otel_api_conformance_bgworker_main(Datum main_arg);
+#ifdef USE_INJECTION_POINTS
+extern PGDLLEXPORT void otel_api_conformance_oom_callback(const char *name,
+														   const void *private_data,
+														   void *arg);
+#endif
 
 /* ----------------------------------------------------------------
  * Tracers: two distinct producer scopes, for the multi-producer tests.
@@ -191,6 +196,9 @@ static int	captured_cap = 0;
 static otel_span_emit_hook_type prev_emit_hook = NULL;
 static otel_sampler_hook_type prev_sampler_hook = NULL;
 static OtelPendingRegistration pending_reg;
+
+/* Exporter misbehaviour during dispatch (t/017); see below. */
+static MemoryContext misbehave_cxt = NULL;
 
 /* ----------------------------------------------------------------
  * Caller-created resource owners (for the "custom owner" scenarios).
@@ -442,6 +450,8 @@ capture_span(const OtelSpan *span)
  */
 static bool conformance_capture_enabled = true;
 
+static void conformance_do_misbehave(const OtelSpan *span);
+
 static void
 conformance_emit_hook(const OtelSpan *span)
 {
@@ -457,6 +467,9 @@ conformance_emit_hook(const OtelSpan *span)
 		}
 		PG_END_TRY();
 	}
+
+	/* Capture happens first; the configured misbehaviour runs after. */
+	conformance_do_misbehave(span);
 
 	if (prev_emit_hook)
 		prev_emit_hook(span);
@@ -503,6 +516,9 @@ _PG_init(void)
 	owners_cxt = AllocSetContextCreate(TopMemoryContext,
 										"otel_api_conformance owners",
 										ALLOCSET_SMALL_SIZES);
+	misbehave_cxt = AllocSetContextCreate(TopMemoryContext,
+										   "otel_api_conformance misbehaviour",
+										   ALLOCSET_SMALL_SIZES);
 
 	DefineCustomEnumVariable("otel_api_conformance.sampler",
 							  "Decision returned by otel_api_conformance's sampler hook.",
@@ -1271,6 +1287,47 @@ otel_api_conformance_record_error_scenario(PG_FUNCTION_ARGS)
 		 * switch internally, but a caller using CopyErrorData() directly,
 		 * as here, must do it itself.
 		 */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		otel_span_record_error(s, edata);
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	otel_span_end(s);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Like otel_api_conformance_record_error_scenario, but with errdetail()
+ * and errhint() set too (that scenario's ereport has neither, so it
+ * can't exercise otel_producer.c's OOM-injection sites for the
+ * detail/hint fields: slot_record_error() only calls slot_strdup() for
+ * a field edata actually has).  Used by t/018's error-message/-detail/
+ * -hint/-filename/-funcname OOM-injection scenarios, which need all
+ * five fields present so each can be failed on its own.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_record_error_full_scenario);
+Datum
+otel_api_conformance_record_error_full_scenario(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	OtelSpanRef s;
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
+	PG_TRY();
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("otel_api_conformance induced error (full)"),
+				 errdetail("otel_api_conformance induced detail"),
+				 errhint("otel_api_conformance induced hint")));
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		otel_span_record_error(s, edata);
@@ -2807,5 +2864,515 @@ otel_api_conformance_abort_hook_reset(PG_FUNCTION_ARGS)
 	conformance_xact_abort_armed = false;
 	conformance_subxact_abort_armed = false;
 	conformance_release_cb_armed = false;
+	PG_RETURN_VOID();
+}
+
+/* ----------------------------------------------------------------
+ * Exporter misbehaviour during dispatch (t/017): the emit hook is
+ * given a mode and a span name to match; once a matching span is
+ * dispatched (after it has been captured above, so tests can see it
+ * was delivered), the hook misbehaves that one way.  otel_api P2
+ * edge-case plan, item 3 (postgres-cdq.9.3).
+ *
+ * "self"/"other" targets: the emit hook has no way to recover an
+ * OtelSpanRef from the OtelSpan it's given (the exporter view has no
+ * handle field), so the test arranges the ref itself beforehand via
+ * otel_api_conformance_set_misbehaviour_ref() -- for end_self, the
+ * same ref the test is about to end (the one that will be
+ * dispatching when the hook runs); for end_other, a ref to a
+ * different, still-open span (e.g. the parent, or a sibling sharing
+ * the owner being released).
+ * ---------------------------------------------------------------- */
+
+typedef enum ConformanceMisbehaviourMode
+{
+	CONFORMANCE_MISBEHAVE_NONE = 0,
+	CONFORMANCE_MISBEHAVE_ERROR,
+	CONFORMANCE_MISBEHAVE_FATAL,
+	CONFORMANCE_MISBEHAVE_START_END,
+	CONFORMANCE_MISBEHAVE_START_END_UNGUARDED,
+	CONFORMANCE_MISBEHAVE_END_SELF,
+	CONFORMANCE_MISBEHAVE_END_OTHER,
+} ConformanceMisbehaviourMode;
+
+/* Depth cap for start_end_unguarded: bounds the recursion so the backend
+ * doesn't overflow its stack; depth > 1 reached is itself the gap. */
+#define CONFORMANCE_MISBEHAVE_UNGUARDED_CAP 50
+
+static ConformanceMisbehaviourMode conformance_misbehave_mode = CONFORMANCE_MISBEHAVE_NONE;
+static char *conformance_misbehave_match_name = NULL;
+static int64 conformance_misbehave_count = 0;
+static int64 conformance_misbehave_target_ref = 0;
+static bool conformance_misbehave_start_end_guard = false;	/* start_end: one level deep */
+static int	conformance_misbehave_unguarded_depth = 0;		/* static recursion counter */
+static int64 conformance_misbehave_max_depth = 0;
+
+static void
+conformance_do_misbehave(const OtelSpan *span)
+{
+	if (conformance_misbehave_mode == CONFORMANCE_MISBEHAVE_NONE)
+		return;
+	if (conformance_misbehave_match_name == NULL || span->name == NULL ||
+		strcmp(span->name, conformance_misbehave_match_name) != 0)
+		return;
+
+	conformance_misbehave_count++;
+
+	switch (conformance_misbehave_mode)
+	{
+		case CONFORMANCE_MISBEHAVE_NONE:
+			break;
+
+		case CONFORMANCE_MISBEHAVE_ERROR:
+			ereport(ERROR,
+					(errmsg("otel_api_conformance: emit hook misbehaviour: error")));
+			break;
+
+		case CONFORMANCE_MISBEHAVE_FATAL:
+
+			/*
+			 * dispatch_span() calls the emit hook (this code) before it
+			 * checks otel_emit_spans_to_log, so a hook that goes FATAL
+			 * here means the span is never reached by otel_producer.c's
+			 * own log-line emission, on any dispatch attempt -- there is
+			 * no way to tell a second (buggy) dispatch attempt apart
+			 * from the first by grepping for otel_producer.c's
+			 * "otel-span: ..." log lines.  Log our own line first,
+			 * numbered by conformance_misbehave_count (already
+			 * incremented above for this call), so a test can count
+			 * dispatch attempts for this span directly.
+			 */
+			ereport(LOG,
+					(errmsg_internal("otel_api_conformance: misbehaviour fatal dispatch #"
+									 INT64_FORMAT " for \"%s\"",
+									 conformance_misbehave_count, span->name)));
+			ereport(FATAL,
+					(errmsg("otel_api_conformance: emit hook misbehaviour: fatal")));
+			break;
+
+		case CONFORMANCE_MISBEHAVE_START_END:
+			if (!conformance_misbehave_start_end_guard)
+			{
+				OtelSpanRef s;
+
+				conformance_misbehave_start_end_guard = true;
+				conformance_misbehave_max_depth = 1;	/* guarded: exactly one level */
+				s = otel_span_start(.tracer = &tracer_a, .name = "conformance.from_hook");
+				otel_span_end(s);
+				conformance_misbehave_start_end_guard = false;
+			}
+			break;
+
+		case CONFORMANCE_MISBEHAVE_START_END_UNGUARDED:
+			{
+				OtelSpanRef s;
+
+				conformance_misbehave_unguarded_depth++;
+				if (conformance_misbehave_unguarded_depth > conformance_misbehave_max_depth)
+					conformance_misbehave_max_depth = conformance_misbehave_unguarded_depth;
+				if (conformance_misbehave_unguarded_depth < CONFORMANCE_MISBEHAVE_UNGUARDED_CAP)
+				{
+					s = otel_span_start(.tracer = &tracer_a, .name = "conformance.from_hook");
+					otel_span_end(s);
+				}
+				conformance_misbehave_unguarded_depth--;
+			}
+			break;
+
+		case CONFORMANCE_MISBEHAVE_END_SELF:
+		case CONFORMANCE_MISBEHAVE_END_OTHER:
+			{
+				OtelSpanRef target = {.v = conformance_misbehave_target_ref};
+
+				otel_span_end(target);
+			}
+			break;
+	}
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_set_emit_misbehaviour);
+Datum
+otel_api_conformance_set_emit_misbehaviour(PG_FUNCTION_ARGS)
+{
+	char	   *mode_s = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *match_name = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(1));
+	ConformanceMisbehaviourMode mode;
+
+	if (strcmp(mode_s, "none") == 0)
+		mode = CONFORMANCE_MISBEHAVE_NONE;
+	else if (strcmp(mode_s, "error") == 0)
+		mode = CONFORMANCE_MISBEHAVE_ERROR;
+	else if (strcmp(mode_s, "fatal") == 0)
+		mode = CONFORMANCE_MISBEHAVE_FATAL;
+	else if (strcmp(mode_s, "start_end") == 0)
+		mode = CONFORMANCE_MISBEHAVE_START_END;
+	else if (strcmp(mode_s, "start_end_unguarded") == 0)
+		mode = CONFORMANCE_MISBEHAVE_START_END_UNGUARDED;
+	else if (strcmp(mode_s, "end_self") == 0)
+		mode = CONFORMANCE_MISBEHAVE_END_SELF;
+	else if (strcmp(mode_s, "end_other") == 0)
+		mode = CONFORMANCE_MISBEHAVE_END_OTHER;
+	else
+		ereport(ERROR, (errmsg("otel_api_conformance: unknown emit misbehaviour mode \"%s\"", mode_s)));
+
+	conformance_misbehave_mode = mode;
+	MemoryContextReset(misbehave_cxt);
+	conformance_misbehave_match_name = match_name
+		? MemoryContextStrdup(misbehave_cxt, match_name) : NULL;
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_set_misbehaviour_ref);
+Datum
+otel_api_conformance_set_misbehaviour_ref(PG_FUNCTION_ARGS)
+{
+	conformance_misbehave_target_ref = PG_GETARG_INT64(0);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_misbehaviour_status);
+Datum
+otel_api_conformance_misbehaviour_status(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					  "{\"count\":" INT64_FORMAT ",\"max_depth\":" INT64_FORMAT "}",
+					  conformance_misbehave_count, conformance_misbehave_max_depth);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_misbehaviour_reset);
+Datum
+otel_api_conformance_misbehaviour_reset(PG_FUNCTION_ARGS)
+{
+	conformance_misbehave_mode = CONFORMANCE_MISBEHAVE_NONE;
+	conformance_misbehave_match_name = NULL;
+	MemoryContextReset(misbehave_cxt);
+	conformance_misbehave_count = 0;
+	conformance_misbehave_target_ref = 0;
+	conformance_misbehave_start_end_guard = false;
+	conformance_misbehave_unguarded_depth = 0;
+	conformance_misbehave_max_depth = 0;
+	PG_RETURN_VOID();
+}
+
+/*
+ * Raw InterruptHoldoffCount/QueryCancelHoldoffCount, for checking that
+ * abort-time dispatch misbehaviour hasn't corrupted them (RESUME_INTERRUPTS()
+ * in AbortTransaction() decrements from whatever errfinish() left behind;
+ * if that's 0, the decrement wraps to UINT32_MAX and every subsequent
+ * INTERRUPTS_CAN_BE_PROCESSED() check in this backend is false forever).
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_holdoff_counts);
+Datum
+otel_api_conformance_holdoff_counts(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					  "{\"interrupt_holdoff\":%u,\"query_cancel_holdoff\":%u}",
+					  InterruptHoldoffCount, QueryCancelHoldoffCount);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+}
+
+/*
+ * Deterministic, crash-free reproduction of the normal-path defect: arms
+ * "error" misbehaviour on a probe-specific span name, starts and ends that
+ * span (the induced ERROR is raised from inside the emit hook and swallowed
+ * by dispatch_span()'s own PG_TRY/PG_CATCH -- see otel_producer.c), and
+ * immediately records CurrentMemoryContext's name and InterruptHoldoffCount
+ * right after otel_span_end() returns, before restoring both so this probe
+ * itself doesn't leave the backend in a bad state.  Optionally wraps the
+ * start/end in the caller's own HOLD_INTERRUPTS()/RESUME_INTERRUPTS(), to
+ * show the same defect is observable whether or not the producer happened
+ * to be inside a holdoff section of its own.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_dispatch_error_probe);
+Datum
+otel_api_conformance_dispatch_error_probe(PG_FUNCTION_ARGS)
+{
+	bool		hold = PG_GETARG_BOOL(0);
+	MemoryContext before_cxt = CurrentMemoryContext;
+	uint32		before_holdoff = InterruptHoldoffCount;
+	const char *before_name = before_cxt->name;
+	MemoryContext after_cxt;
+	uint32		after_holdoff;
+	const char *after_name;
+	OtelSpanRef s;
+	StringInfoData buf;
+
+	conformance_misbehave_mode = CONFORMANCE_MISBEHAVE_ERROR;
+	MemoryContextReset(misbehave_cxt);
+	conformance_misbehave_match_name =
+		MemoryContextStrdup(misbehave_cxt, "conformance.memcxt_probe");
+	conformance_misbehave_count = 0;
+
+	if (hold)
+		HOLD_INTERRUPTS();
+
+	s = otel_span_start(.tracer = &tracer_a, .name = "conformance.memcxt_probe");
+	otel_span_end(s);			/* the induced ERROR is raised and swallowed inside this call */
+
+	/* Record exactly what dispatch_span()'s PG_CATCH left behind. */
+	after_cxt = CurrentMemoryContext;
+	after_holdoff = InterruptHoldoffCount;
+	after_name = after_cxt->name;
+
+	/* Restore, so this probe itself doesn't crash or corrupt state. */
+	MemoryContextSwitchTo(before_cxt);
+	if (hold)
+	{
+		InterruptHoldoffCount = before_holdoff + 1;	/* undo dispatch's damage first */
+		RESUME_INTERRUPTS();							/* ...then properly close our own hold */
+	}
+	else
+		InterruptHoldoffCount = before_holdoff;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					  "{\"held\":%s,\"before_context\":", hold ? "true" : "false");
+	append_json_string(&buf, before_name);
+	appendStringInfoString(&buf, ",\"after_context\":");
+	append_json_string(&buf, after_name);
+	appendStringInfo(&buf,
+					  ",\"before_holdoff\":%u,\"after_holdoff\":%u,\"misbehave_count\":" INT64_FORMAT "}",
+					  before_holdoff, after_holdoff, conformance_misbehave_count);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+}
+
+/* ----------------------------------------------------------------
+ * Real out-of-memory paths via injection points (t/018, postgres-cdq.9.2).
+ *
+ * otel_api's own allocation-failure injection points (otel_producer.c,
+ * "otel-api-oom-<site>") are named test-only points guarded by
+ * USE_INJECTION_POINTS, exactly like core's INJECTION_POINT() elsewhere.
+ * This section is otel_api_conformance's own callback for them: unlike
+ * core's stock injection_points module (used for the single mid-span
+ * ERROR point in t/003), it needs (a) a bool-vs-ERROR split matching
+ * otel_api's two kinds of site, (b) a per-site skip/fail countdown so a
+ * test can fail (for example) only the second hit at a site, and
+ * (c) per-site hit/fail counters a TAP test can read back.
+ *
+ * Everything here is guarded by #ifdef USE_INJECTION_POINTS except the
+ * SQL-callable wrappers themselves, which always exist (so CREATE
+ * EXTENSION otel_api_conformance never fails) but raise a clear ERROR
+ * at call time on a build without injection points;
+ * otel_api_conformance_oom_available() lets a TAP test check first and
+ * skip cleanly instead.
+ * ---------------------------------------------------------------- */
+
+#ifdef USE_INJECTION_POINTS
+
+#define OOM_SITE_MAX_NAMES	32
+
+typedef struct OomSiteState
+{
+	char	   *name;			/* "otel-api-oom-<site>", in oom_cxt */
+	int			skip;			/* hits left to let through before failing */
+	int			fail_budget;	/* hits left to fail; -1 = fail forever */
+	int64		hits;			/* every hit from this backend, skipped or not */
+	int64		fails;			/* hits actually forced to fail */
+} OomSiteState;
+
+static MemoryContext oom_cxt = NULL;
+static OomSiteState oom_sites[OOM_SITE_MAX_NAMES];
+static int	n_oom_sites = 0;
+
+static OomSiteState *
+oom_site_find(const char *name)
+{
+	int			i;
+
+	for (i = 0; i < n_oom_sites; i++)
+		if (strcmp(oom_sites[i].name, name) == 0)
+			return &oom_sites[i];
+	return NULL;
+}
+
+static OomSiteState *
+oom_site_find_or_add(const char *name)
+{
+	OomSiteState *s = oom_site_find(name);
+
+	if (s != NULL)
+		return s;
+	if (n_oom_sites == OOM_SITE_MAX_NAMES)
+		ereport(ERROR, (errmsg("otel_api_conformance: too many distinct OOM injection sites")));
+	if (oom_cxt == NULL)
+		oom_cxt = AllocSetContextCreate(TopMemoryContext, "otel_api_conformance oom",
+										 ALLOCSET_SMALL_SIZES);
+	s = &oom_sites[n_oom_sites++];
+	s->name = MemoryContextStrdup(oom_cxt, name);
+	s->skip = 0;
+	s->fail_budget = 1;
+	s->hits = 0;
+	s->fails = 0;
+	return s;
+}
+
+/*
+ * The injection callback attached to every "otel-api-oom-*" point this
+ * backend arms.  private_data is this backend's pid, set at attach time
+ * (otel_api_conformance_oom_arm below): a call for the same point name
+ * from any other backend is a no-op, matching how otel_api's own points
+ * are meant to be exercised (armed and read back within one backend/
+ * connection; see the handover's "Lessons").
+ *
+ * arg != NULL (otel_producer.c's bool-return sites): on a forced
+ * failure, sets *(bool *) arg = true, so the caller sees exactly the
+ * NULL/false its allocator would have returned.
+ * arg == NULL (the three sites that precede a call that can raise ERROR
+ * on a real OOM: ResourceOwnerEnlarge, a slot's first context creation,
+ * otel_tracer_register): on a forced failure, raises
+ * ERRCODE_OUT_OF_MEMORY itself, in the caller's place.
+ */
+void
+otel_api_conformance_oom_callback(const char *name, const void *private_data, void *arg)
+{
+	int			pid = *(const int *) private_data;
+	OomSiteState *s;
+
+	if (pid != MyProcPid)
+		return;
+
+	s = oom_site_find_or_add(name);
+	s->hits++;
+
+	if (s->skip > 0)
+	{
+		s->skip--;
+		return;
+	}
+	if (s->fail_budget == 0)
+		return;					/* countdown exhausted: stop failing */
+	if (s->fail_budget > 0)
+		s->fail_budget--;
+	s->fails++;
+
+	if (arg != NULL)
+		*(bool *) arg = true;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("otel_api_conformance: injected out-of-memory at \"%s\"", name)));
+}
+
+#endif							/* USE_INJECTION_POINTS */
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_oom_available);
+Datum
+otel_api_conformance_oom_available(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	PG_RETURN_BOOL(true);
+#else
+	PG_RETURN_BOOL(false);
+#endif
+}
+
+/*
+ * Arm "otel-api-oom-<site>" for this backend: the next `skip` hits pass
+ * through unfailed, then the following `fail_count` hits are forced to
+ * fail (-1 means fail every hit from then on, not just fail_count of
+ * them).  Attaching twice for the same site without disarming first is
+ * a core InjectionPointAttach error ("point already exists"), which is
+ * deliberately not caught here.
+ */
+PG_FUNCTION_INFO_V1(otel_api_conformance_oom_arm);
+Datum
+otel_api_conformance_oom_arm(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	char	   *site = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	int32		skip = PG_ARGISNULL(1) ? 0 : PG_GETARG_INT32(1);
+	int32		fail_count = PG_ARGISNULL(2) ? 1 : PG_GETARG_INT32(2);
+	char	   *name;
+	OomSiteState *s;
+	static int	attach_pid;
+
+	name = psprintf("otel-api-oom-%s", site);
+	s = oom_site_find_or_add(name);
+	s->skip = skip;
+	s->fail_budget = fail_count;
+
+	/*
+	 * private_data must outlive the attach call (InjectionPointAttach
+	 * copies private_data_size bytes, per its header comment) -- a
+	 * plain local wouldn't; a function-static does, and each call
+	 * overwrites it with this backend's own pid before attaching, which
+	 * is all any one backend ever needs.
+	 */
+	attach_pid = MyProcPid;
+	InjectionPointAttach(name, "otel_api_conformance", "otel_api_conformance_oom_callback",
+						 &attach_pid, sizeof(attach_pid));
+	pfree(name);
+	PG_RETURN_VOID();
+#else
+	ereport(ERROR,
+			(errmsg("otel_api_conformance: this build has no injection points "
+					"(USE_INJECTION_POINTS); call otel_api_conformance_oom_available() first")));
+	PG_RETURN_VOID();			/* unreachable */
+#endif
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_oom_disarm);
+Datum
+otel_api_conformance_oom_disarm(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	char	   *site = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *name = psprintf("otel-api-oom-%s", site);
+
+	(void) InjectionPointDetach(name);
+	pfree(name);
+	PG_RETURN_VOID();
+#else
+	ereport(ERROR,
+			(errmsg("otel_api_conformance: this build has no injection points "
+					"(USE_INJECTION_POINTS)")));
+	PG_RETURN_VOID();			/* unreachable */
+#endif
+}
+
+/* {"hits":N,"fails":N} for one site, or {} if it was never hit. */
+PG_FUNCTION_INFO_V1(otel_api_conformance_oom_status);
+Datum
+otel_api_conformance_oom_status(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	char	   *site = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *name = psprintf("otel-api-oom-%s", site);
+	OomSiteState *s = oom_site_find(name);
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	if (s == NULL)
+		appendStringInfoString(&buf, "{\"hits\":0,\"fails\":0}");
+	else
+		appendStringInfo(&buf, "{\"hits\":" INT64_FORMAT ",\"fails\":" INT64_FORMAT "}",
+						  s->hits, s->fails);
+	pfree(name);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+#else
+	ereport(ERROR,
+			(errmsg("otel_api_conformance: this build has no injection points "
+					"(USE_INJECTION_POINTS)")));
+	PG_RETURN_NULL();			/* unreachable */
+#endif
+}
+
+/* Clears all sites' counters/countdowns; does not detach anything. */
+PG_FUNCTION_INFO_V1(otel_api_conformance_oom_reset);
+Datum
+otel_api_conformance_oom_reset(PG_FUNCTION_ARGS)
+{
+#ifdef USE_INJECTION_POINTS
+	n_oom_sites = 0;
+	if (oom_cxt != NULL)
+		MemoryContextReset(oom_cxt);
+#endif
 	PG_RETURN_VOID();
 }
