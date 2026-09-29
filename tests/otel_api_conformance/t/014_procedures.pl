@@ -134,62 +134,51 @@ for my $txn_action (qw(commit rollback))
 }
 
 # ----------------------------------------------------------------
-# TopTransactionResourceOwner: COMMIT inside the procedure ends the
-# *old* top-transaction resource owner and starts a new one for the
-# continuation.  The span, still open, is released by that owner on a
-# *commit* path: today that's a leak (dropped, not exported), matching
-# the plan's "Expected today" note.  ROLLBACK instead unwinds it
-# (exported with ERROR status).
+# TopTransactionResourceOwner and the default owner (the CALL portal's
+# resource owner).  A COMMIT inside the procedure releases the owner
+# with the span still open: today that is a leak (dropped, not
+# exported).  A ROLLBACK unwinds it (exported with ERROR status).
+# Either way the child, started after the COMMIT/ROLLBACK, is a root.
 # ----------------------------------------------------------------
+for my $owner_mode (qw(toptxn default))
 {
-	my $r = run_proc_scenario('toptxn', 'commit', 0);
-	ok(!$r->{parent}, 'toptxn owner, commit: the parent span is NOT exported (dropped as a leak)');
-	cmp_ok($r->{counters}->{leaked_at_commit}, '>=', 1,
-		'toptxn owner, commit: leaked_at_commit counter moved');
-	ok(!$r->{child} || $r->{child}->{parent_span_id} eq ('0' x 16),
-		'toptxn owner, commit: the child does NOT parent to the (already-released) parent');
-	is($r->{stack_after}, '0', 'toptxn owner, commit: nothing left on the active stack afterwards');
+	{
+		my $r = run_proc_scenario($owner_mode, 'commit', 0);
+		ok(!$r->{parent}, "$owner_mode owner, commit: the parent span is NOT exported (dropped as a leak)");
+		is($r->{counters}->{leaked_at_commit}, 1, "$owner_mode owner, commit: leaked_at_commit is 1");
+		ok($r->{child}, "$owner_mode owner, commit: the child span is exported");
+		is($r->{child}->{parent_span_id}, '0' x 16,
+			"$owner_mode owner, commit: the child is a root, not parented to the released parent")
+			if $r->{child};
+		is($r->{stack_after}, '0', "$owner_mode owner, commit: nothing left on the active stack afterwards");
 
-	local $TODO = 'desired future behaviour (design decision pending): a procedure-lifetime span '
-		. 'tied to the CALL portal should survive the inner COMMIT and keep its parentage, not be '
-		. 'dropped as a leak';
-	ok($r->{parent}, 'toptxn owner, commit: [desired] the parent span survives the inner COMMIT');
-}
+		local $TODO = 'desired future behaviour (design decision pending): a procedure-lifetime span '
+			. 'tied to the CALL portal should survive the inner COMMIT and keep its parentage, not be '
+			. 'dropped as a leak';
+		ok($r->{parent}, "$owner_mode owner, commit: [desired] the parent span survives the inner COMMIT");
+		is($r->{child}->{parent_span_id}, $r->{parent}->{span_id},
+			"$owner_mode owner, commit: [desired] the child parents to the procedure span")
+			if $r->{child} && $r->{parent};
+	}
 
-{
-	my $r = run_proc_scenario('toptxn', 'rollback', 0);
-	ok($r->{parent}, 'toptxn owner, rollback: the parent span is exported (unwound)');
-	is($r->{parent}->{status}, 2, 'toptxn owner, rollback: ERROR status') if $r->{parent};
-	cmp_ok($r->{counters}->{unwound}, '>=', 1, 'toptxn owner, rollback: unwound counter moved');
-	ok(!$r->{child} || $r->{child}->{parent_span_id} eq ('0' x 16),
-		'toptxn owner, rollback: the child does NOT parent to the (already-unwound) parent');
-	is($r->{stack_after}, '0', 'toptxn owner, rollback: nothing left on the active stack afterwards');
+	{
+		my $r = run_proc_scenario($owner_mode, 'rollback', 0);
+		ok($r->{parent}, "$owner_mode owner, rollback: the parent span is exported (unwound)");
+		is($r->{parent}->{status}, 2, "$owner_mode owner, rollback: ERROR status") if $r->{parent};
+		is($r->{counters}->{unwound}, 1, "$owner_mode owner, rollback: unwound is 1");
+		ok($r->{child}, "$owner_mode owner, rollback: the child span is exported");
+		is($r->{child}->{parent_span_id}, '0' x 16,
+			"$owner_mode owner, rollback: the child is a root, not parented to the unwound parent")
+			if $r->{child};
+		is($r->{stack_after}, '0', "$owner_mode owner, rollback: nothing left on the active stack afterwards");
 
-	local $TODO = 'desired future behaviour (design decision pending): a procedure-lifetime span '
-		. 'should only be exported with ERROR status if the CALL itself fails, not merely because '
-		. 'it did an internal ROLLBACK';
-	is($r->{parent}->{status}, 0,
-		'toptxn owner, rollback: [desired] the parent keeps UNSET status across a successful CALL')
-		if $r->{parent};
-}
-
-# ----------------------------------------------------------------
-# Default owner: belongs to the CALL statement's own portal.  Whether
-# that portal (and hence the span) survives an inner COMMIT/ROLLBACK,
-# or is released the same way TopTransactionResourceOwner is, is
-# exactly the open question -- recorded here, not assumed.
-# ----------------------------------------------------------------
-for my $txn_action (qw(commit rollback))
-{
-	my $r = run_proc_scenario('default', $txn_action, 0);
-	my $exported = $r->{parent} ? 1 : 0;
-	my $leaked = $r->{counters}->{leaked_at_commit};
-	my $unwound = $r->{counters}->{unwound};
-	ok(1, "default owner, $txn_action: recorded -- exported=$exported, "
-		. "status=" . (defined $r->{parent} ? $r->{parent}->{status} : 'n/a')
-		. ", leaked_at_commit=$leaked, unwound=$unwound, "
-		. "stack_after=$r->{stack_after}");
-	is($r->{stack_after}, '0', "default owner, $txn_action: nothing left on the active stack afterwards");
+		local $TODO = 'desired future behaviour (design decision pending): a procedure-lifetime span '
+			. 'should only be exported with ERROR status if the CALL itself fails, not merely because '
+			. 'it did an internal ROLLBACK';
+		is($r->{parent}->{status}, 0,
+			"$owner_mode owner, rollback: [desired] the parent keeps UNSET status across a successful CALL")
+			if $r->{parent};
+	}
 }
 
 # ----------------------------------------------------------------
@@ -255,17 +244,12 @@ SQL
 
 # ----------------------------------------------------------------
 # otel_postgres_tracing variant: with otel.trace_all_queries on, the
-# CALL statement itself gets a default-owner statement span from
-# otel_postgres_tracing.  Prediction (from reading otel_trace.c and
-# core's PreCommit_Portals/portal resource-owner lifecycle): the
-# CALL's own statement span is a default-owner span belonging to the
-# CALL's own portal; PreCommit_Portals() releases the *active*
-# portal's resource owner as part of an inner COMMIT, so that
-# statement span is reported leaked at the commit; it is exported as
-# ERROR at a ROLLBACK; and a further statement after a COMMIT inside
-# the same CALL loses it as its parent (a new server-kind root span,
-# or no span at all if otel.trace_all_queries were off, but it's on
-# here).
+# CALL statement gets a default-owner statement span named "CALL".
+# Its plpgsql statements before the COMMIT/ROLLBACK are its children;
+# the statement after it is a new root.  At a COMMIT the CALL span is
+# dropped as a leak, but its children have already been exported, so
+# they are orphans (their parent never arrives).  At a ROLLBACK the
+# CALL span is exported with ERROR status.
 # ----------------------------------------------------------------
 {
 	my $node2 = PostgreSQL::Test::Cluster->new('tracing');
@@ -297,39 +281,53 @@ SQL
 		my $out = $node2->safe_psql('postgres', <<SQL);
 SELECT otel_api_conformance_reset() AS r1 \\gset
 CALL conformance_proc_tracing('$txn_action');
-SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s WHERE s->>'name' LIKE '%conformance_proc_tracing%';
+SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SELECT otel_api_conformance_counters();
-SELECT otel_api_conformance_span_current();
 SQL
 		my @lines = split /\n/, $out;
-		my @s = parse_spans($lines[0]);
+		my @all = parse_spans($lines[0]);
 		my $counters = decode_json($lines[1]);
 
-		# otel.trace_all_queries=on means the diagnostic SELECT
-		# otel_api_conformance_span_current() call below is itself
-		# wrapped in its own (still-open, at the point it evaluates its
-		# own targetlist) statement span, so stack_after is never 0
-		# here -- unlike every other scenario in this file, which
-		# doesn't have otel_postgres_tracing loaded.  Just record it.
-		ok(1, "otel_postgres_tracing, CALL + $txn_action: recorded -- "
-			. scalar(@s) . " span(s) named after the CALL, leaked_at_commit="
-			. $counters->{leaked_at_commit} . ", unwound=" . $counters->{unwound});
+		my $is_proc_stmt = sub {
+			my ($sp, $text) = @_;
+			grep { $_->{key} eq 'db.query.text' && $_->{value} =~ $text } @{ $sp->{attrs} };
+		};
+		my %by_id = map { $_->{span_id} => $_ } @all;
+		my ($call) = grep { $_->{name} eq 'CALL' } @all;
+		my @sleeps = grep { $_->{name} eq 'pgsql.execute' && $is_proc_stmt->($_, qr/^SELECT pg_sleep\(0\)/) } @all;
+		is(scalar(@sleeps), 2, "otel_postgres_tracing, CALL + $txn_action: both pg_sleep statements have a span");
+		my ($before, $after) = sort { $a->{start_time} <=> $b->{start_time} } @sleeps;
+		my @orphans = grep { $_->{parent_span_id} ne '0' x 16 && !$by_id{ $_->{parent_span_id} } } @all;
+
+		is($after->{parent_span_id}, '0' x 16,
+			"otel_postgres_tracing, CALL + $txn_action: the statement after it is a new root")
+			if $after;
 
 		if ($txn_action eq 'commit')
 		{
-			cmp_ok($counters->{leaked_at_commit}, '>=', 1,
-				'otel_postgres_tracing, CALL + commit: the CALL statement span is reported leaked '
-				. '(PreCommit_Portals releases the active portal\'s resource owner at the inner commit)');
+			ok(!$call, 'otel_postgres_tracing, CALL + commit: the CALL span is NOT exported (dropped as a leak)');
+			is($counters->{leaked_at_commit}, 1, 'otel_postgres_tracing, CALL + commit: leaked_at_commit is 1');
+			ok(scalar(@orphans) >= 1 && (grep { $_ == $before } @orphans),
+				'otel_postgres_tracing, CALL + commit: statements before the COMMIT are exported as orphans');
 
 			local $TODO = 'desired future behaviour (design decision pending): the CALL statement '
 				. 'span should survive the inner COMMIT with parentage intact, not be dropped as a leak';
-			cmp_ok(scalar(grep { $_->{status} == 0 } @s), '>=', 1,
+			ok($call && $call->{status} == 0,
 				'otel_postgres_tracing, CALL + commit: [desired] the CALL span is exported with UNSET status');
+			is(scalar(@orphans), 0, 'otel_postgres_tracing, CALL + commit: [desired] no orphaned spans');
+			is($after->{parent_span_id}, $call->{span_id},
+				'otel_postgres_tracing, CALL + commit: [desired] the statement after COMMIT parents to CALL')
+				if $after && $call;
 		}
 		else
 		{
-			cmp_ok($counters->{unwound}, '>=', 1,
-				'otel_postgres_tracing, CALL + rollback: the CALL statement span is unwound (ERROR status)');
+			ok($call, 'otel_postgres_tracing, CALL + rollback: the CALL span is exported');
+			is($call->{status}, 2, 'otel_postgres_tracing, CALL + rollback: ERROR status (unwound)') if $call;
+			is($counters->{unwound}, 1, 'otel_postgres_tracing, CALL + rollback: unwound is 1');
+			is($before->{parent_span_id}, $call->{span_id},
+				'otel_postgres_tracing, CALL + rollback: the statement before ROLLBACK parents to CALL')
+				if $before && $call;
+			is(scalar(@orphans), 0, 'otel_postgres_tracing, CALL + rollback: no orphaned spans');
 		}
 	}
 

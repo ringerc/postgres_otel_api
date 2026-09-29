@@ -2558,18 +2558,18 @@ static int64 conformance_abort_span_ended = 0;
 static int64 conformance_abort_span_error_caught = 0;
 
 /*
- * Common action run from all three trigger points.  Wrapped in its own
- * PG_TRY: the point of this test is to observe whether otel_api's own
- * ResourceOwnerEnlarge() call raises ERROR when the target owner is
- * already releasing, not to find out what an *uncontained* ERROR does
- * to a caller with no PG_CATCH of its own deep inside abort processing
- * -- that is exactly the kind of thing a real extension's abort-time
- * callback is expected to guard against, and every counter below is
- * still meaningful whether or not the ERROR happens.
+ * Common action run from all three trigger points.  The PG_TRY catches an
+ * ERROR from otel_span_start() so that the counters report it.  errfinish()
+ * zeroes InterruptHoldoffCount, and abort processing runs with interrupts
+ * held, so a handler at this depth has to restore the count and the memory
+ * context itself (see the comment in errfinish()).
  */
 static void
 conformance_abort_action(const char *label)
 {
+	uint32		save_holdoff = InterruptHoldoffCount;
+	MemoryContext save_cxt = CurrentMemoryContext;
+
 	conformance_abort_hook_ran = true;
 	PG_TRY();
 	{
@@ -2599,6 +2599,8 @@ conformance_abort_action(const char *label)
 	}
 	PG_CATCH();
 	{
+		MemoryContextSwitchTo(save_cxt);
+		InterruptHoldoffCount = save_holdoff;
 		conformance_abort_span_error_caught++;
 		FlushErrorState();
 	}

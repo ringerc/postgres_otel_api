@@ -34,17 +34,11 @@ use JSON::PP;
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'otel_api,otel_api_conformance'\n"
-	# The release_callback scenario below crashes a cassert build (a real
-	# finding, not an intended test outcome -- see its comment); let the
-	# postmaster restart itself instead of shutting the whole cluster down.
-	. "restart_after_crash = on\n");
+	"shared_preload_libraries = 'otel_api,otel_api_conformance'\n");
 $node->start;
 
 $node->safe_psql('postgres',
 	'CREATE EXTENSION otel_api; CREATE EXTENSION otel_api_conformance');
-
-my $debug_assertions = $node->safe_psql('postgres', "SHOW debug_assertions") eq 'on';
 
 sub parse_spans
 {
@@ -198,44 +192,13 @@ SQL
 }
 
 # ----------------------------------------------------------------
-# RegisterResourceReleaseCallback: this callback is global and always
-# fires with CurrentResourceOwner pointed at an owner that has already
-# started releasing.  A default-owner otel_span_start() there hits
-# ResourceOwnerEnlarge()'s "called after release started" ERROR: the
-# "starting on an owner that is already releasing raises ERROR inside
-# abort" case the plan asks about, confirmed.
-#
-# *** Real finding, not an intended test outcome ***
-# otel_api_conformance's own callback (conformance_abort_action() in
-# the .c file) wraps the otel_span_start() call in its own PG_TRY, so
-# the ERROR is caught right where it happens, not left to propagate.
-# On a non-cassert (production) build that is enough: the caught ERROR
-# leaves the backend fully usable (verified below).  On a cassert
-# build, though, catching this specific ERROR -- raised deep inside
-# AbortTransaction()'s own ResourceOwnerRelease() call, itself inside
-# the "for (item = ResourceRelease_callbacks...)" loop in
-# ResourceOwnerReleaseInternal() -- crashes the backend outright:
-#
-#   TRAP: failed Assert("InterruptHoldoffCount > 0"), File:
-#   "xact.c", Line: 3058 (the RESUME_INTERRUPTS() at the very end of
-#   AbortTransaction())
-#
-# i.e. by the time AbortTransaction() reaches its own closing
-# RESUME_INTERRUPTS() (paired with the HOLD_INTERRUPTS() at its own
-# top), InterruptHoldoffCount has already been decremented one time
-# too many.  This isn't an otel_api bug in the sense of a wrong
-# otel_api behaviour -- otel_api's own bookkeeping (counters, slots,
-# the stack) is fine, as the counters below show -- it's that a
-# PG_CATCH anywhere inside this specific nested "ERROR raised while
-# already inside AbortTransaction()'s own ResourceOwnerRelease() call"
-# situation corrupts interrupt-holdoff accounting, whether or not
-# otel_api is involved at all (any extension's release callback that
-# tries an operation liable to ERROR and catches it here would hit the
-# same thing).  Reproducible on demand, 100% of the time, from a clean
-# cluster.  On a production (non-cassert) build the same accounting
-# corruption presumably still happens -- it just isn't caught by an
-# Assert -- so it's flagged here as a real risk to record and revisit,
-# not something to leave undocumented because the crash is cassert-only.
+# RegisterResourceReleaseCallback: this callback fires with
+# CurrentResourceOwner pointing at an owner that has started releasing.
+# A default-owner otel_span_start() there fails in core's
+# ResourceOwnerEnlarge() with "called after release started", before
+# otel_api takes a slot.  The helper catches the ERROR and restores
+# InterruptHoldoffCount, as errfinish() requires of a handler inside a
+# holdoff section.
 # ----------------------------------------------------------------
 {
 	my ($ret, $stdout, $stderr) = $node->psql(
@@ -250,59 +213,31 @@ SELECT otel_api_conformance_abort_hook_status();
 SQL
 		on_error_stop => 0);
 
-	if ($debug_assertions)
-	{
-		# The backend is expected to crash finding this out (see the
-		# comment above).  $ret/$stderr reflect a lost connection, not a
-		# clean SQL error.
-		like($stderr, qr/server closed the connection unexpectedly|connection to server was lost/,
-			'release_callback (cassert): the backend crashes on this ERROR-during-abort, as documented above');
+	like($stderr, qr/division by zero/, 'release_callback: the induced error aborts the transaction');
 
-		# restart_after_crash = on: the postmaster restarts the backend
-		# fleet on its own; wait for it to come back before continuing.
-		my $reconnected = 0;
-		for (1 .. 60)
-		{
-			last if $reconnected = eval { $node->safe_psql('postgres', 'SELECT 1') eq '1' };
-			sleep(1);
-		}
-		ok($reconnected, 'release_callback (cassert): the cluster recovers and accepts connections again');
+	my @lines = split /\n/, $stdout;
+	my $status = decode_json($lines[0]);
+	ok($status->{ran}, 'release_callback: the RegisterResourceReleaseCallback callback ran');
+	is($status->{error_caught}, 1,
+		'release_callback: starting a span on an owner already releasing raised ERROR, caught here');
+	is($status->{started}, 0,
+		'release_callback: the span never actually started (ResourceOwnerEnlarge failed first)');
+	is($status->{span_current}, 0, 'release_callback: no stack entry was left behind');
 
-		my $log = slurp_file($node->logfile);
-		like($log, qr/failed Assert\("InterruptHoldoffCount > 0"\)/,
-			'release_callback (cassert): the log shows the specific Assert this test documents');
-	}
-	else
-	{
-		like($stderr, qr/division by zero/, 'release_callback (no asserts): the induced error aborts the transaction');
-
-		my @lines = split /\n/, $stdout;
-		my $status = decode_json($lines[0]);
-		ok($status->{ran}, 'release_callback (no asserts): the RegisterResourceReleaseCallback callback ran');
-		is($status->{error_caught}, 1,
-			'release_callback (no asserts): starting a span on an owner already releasing raised ERROR, caught here');
-		is($status->{started}, 0,
-			'release_callback (no asserts): the span never actually started (ResourceOwnerEnlarge failed first)');
-		is($status->{span_current}, 0, 'release_callback (no asserts): no stack entry was left behind');
-
-		# The backend is usable afterwards: no crash, no lingering slot
-		# or stack corruption from the caught ERROR (otel_api's own
-		# state is fine; see the comment above about InterruptHoldoffCount
-		# regardless).
-		my $followup = $node->safe_psql('postgres', <<'SQL');
+	# The backend is usable afterwards: no lingering slot or stack state.
+	my $followup = $node->safe_psql('postgres', <<'SQL');
 SELECT otel_api_conformance_end(otel_api_conformance_start('conformance.abort.release_followup')) AS r \gset
 SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s WHERE s->>'name' = 'conformance.abort.release_followup';
 SELECT otel_api_conformance_counters();
 SQL
-		my @f = split /\n/, $followup;
-		is(scalar(parse_spans($f[0])), 1,
-			'release_callback (no asserts): the backend is unaffected -- a following span starts and ends fine');
-		my $c = decode_json($f[1]);
-		is($c->{start_bad_args}, 0,
-			"release_callback (no asserts): the failed start was not counted as start_bad_args (it never "
-			. "reached otel_api at all -- the ERROR came from core's ResourceOwnerEnlarge, before otel_api "
-			. "took a slot)");
-	}
+	my @f = split /\n/, $followup;
+	is(scalar(parse_spans($f[0])), 1,
+		'release_callback: the backend is unaffected -- a following span starts and ends fine');
+	my $c = decode_json($f[1]);
+	is($c->{start_bad_args}, 0,
+		"release_callback: the failed start was not counted as start_bad_args (it never "
+		. "reached otel_api at all -- the ERROR came from core's ResourceOwnerEnlarge, before otel_api "
+		. "took a slot)");
 }
 
 $node->stop;
