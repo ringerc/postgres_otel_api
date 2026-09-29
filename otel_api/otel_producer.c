@@ -689,10 +689,32 @@ slot_record_error(OtelSlot *slot, const ErrorData *edata)
 }
 
 /*
+ * "SQLSTATE / message" in the slot's context, for a status description.
+ * NULL if it can't be allocated.
+ */
+static const char *
+error_description(OtelSlot *slot, const char *sqlstate, const char *message)
+{
+	char	   *buf = MemoryContextAllocExtended(slot->cxt, 256, MCXT_ALLOC_NO_OOM);
+
+	if (buf)
+	{
+		if (message)
+			snprintf(buf, 256, "%s / %s", sqlstate, message);
+		else
+			strlcpy(buf, sqlstate, 256);
+	}
+	return buf;
+}
+
+/*
  * emit_log_hook: record WARNING and worse into the innermost recording
- * span.  An ERROR is also recorded into every other span on the stack
- * that isn't a session span: the abort that follows ends them too, and
- * they should say why.
+ * span.  An ERROR goes into the innermost recording span that isn't a
+ * session span, since the abort that follows ends and exports it; that
+ * span gets the exception event.  The other non-session spans on the
+ * stack are ended by the same abort: they get ERROR status and the
+ * SQLSTATE and message as their status description, but no event.
+ * Session spans outlive the abort and are left alone.
  *
  * This runs for errors that reach EmitErrorReport, which for a top-level
  * ERROR is before transaction abort releases the spans.  Errors caught
@@ -704,20 +726,37 @@ otel_emit_log_hook(ErrorData *edata)
 {
 	if (edata->elevel >= WARNING && CritSectionCount == 0)
 	{
-		bool		innermost = true;
+		bool		recorded = false;
 
 		for (int i = span_stack_depth - 1; i >= 0; i--)
 		{
 			int32		e = span_stack[i];
+			OtelSlot   *slot;
 
 			if (e < 0 || slots[e].dispatching)
 				continue;
-			if (innermost ||
-				(edata->elevel >= ERROR && !slots[e].session))
-				slot_record_error(&slots[e], edata);
-			innermost = false;
+			slot = &slots[e];
 			if (edata->elevel < ERROR)
+			{
+				slot_record_error(slot, edata);
 				break;
+			}
+			if (slot->session)
+				continue;
+			if (!recorded)
+			{
+				slot_record_error(slot, edata);
+				recorded = true;
+			}
+			else
+			{
+				slot->span.status = OTEL_STATUS_ERROR;
+				if (slot->span.status_description == NULL &&
+					edata->sqlerrcode != ERRCODE_OUT_OF_MEMORY)
+					slot->span.status_description =
+						error_description(slot, unpack_sql_state(edata->sqlerrcode),
+										  edata->message);
+			}
 		}
 	}
 	if (prev_emit_log_hook)
@@ -766,18 +805,7 @@ lower_error_event(OtelSlot *slot)
 		slot->span.dropped_events++;
 
 	if (slot->span.status == OTEL_STATUS_ERROR && slot->span.status_description == NULL)
-	{
-		char	   *buf = MemoryContextAllocExtended(slot->cxt, 256, MCXT_ALLOC_NO_OOM);
-
-		if (buf)
-		{
-			if (err->message)
-				snprintf(buf, 256, "%s / %s", err->sqlstate, err->message);
-			else
-				strlcpy(buf, err->sqlstate, 256);
-			slot->span.status_description = buf;
-		}
-	}
+		slot->span.status_description = error_description(slot, err->sqlstate, err->message);
 }
 
 

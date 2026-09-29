@@ -169,7 +169,7 @@ like(
 
 # ----------------------------------------------------------------------
 # Test 2: a query that errors emits a log line with status=2 (ERROR)
-# and an event in the events array.
+# and the SQLSTATE and message as the status description.
 # ----------------------------------------------------------------------
 
 $log_offset = -s $node->logfile;
@@ -181,8 +181,8 @@ $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
 
 like(
 	$log,
-	qr/otel-span: \{.*"status":2.*"events":\[\{.*"name":"exception".*"exception\.type":"22012"/s,
-	'errored span log line shows status=ERROR with a lowered "exception" event');
+	qr/otel-span: \{.*"status":2,"status_description":"22012 \/ division by zero"/,
+	'errored span log line shows status=ERROR with the SQLSTATE and message');
 
 # ----------------------------------------------------------------------
 # Tidy up.

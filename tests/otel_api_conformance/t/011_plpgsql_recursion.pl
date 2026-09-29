@@ -309,6 +309,15 @@ SQL
 		'(d) the innermost span carries exception.type 54001 via automatic top-level capture');
 	like($exc_attrs{'exception.message'}, qr/stack depth limit exceeded/,
 		'(d) ... and the matching exception.message');
+	# The exception event is recorded once, in the innermost span; the
+	# enclosing spans carry only ERROR status and a short description.
+	my @with_exc = grep {
+		grep { $_->{name} eq 'exception' } @{ $_->{events} // [] }
+	} @s;
+	is(scalar(@with_exc), 1, '(d) only one span carries the exception event');
+	is(scalar(grep { ($_->{status_description} // '') !~ /^54001 \/ stack depth limit exceeded/ } @s), 0,
+		'(d) every span has the SQLSTATE and message as its status description')
+		or diag(encode_json([ map { $_->{status_description} } @s ]));
 	is($cur, '0', '(d) active stack is empty after the aborted statement');
 }
 

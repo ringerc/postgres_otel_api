@@ -291,22 +291,14 @@ is(first_value(@msgs), '4',
 $span = first_value(@msgs);
 like($span, qr/status=2\n/,
 	'span status is ERROR (2) for a query that raised an ereport(ERROR)');
-# In current postgres (v18+), ERROR's numeric value is 21
-# (WARNING_CLIENT_ONLY occupies 20).
-# The ereport is lowered by the producer into a generic "exception"
-# event whose ereport fields are carried as event attributes.
-like($span, qr/event\.name=exception\n/,
-	'ereport lowered into a generic "exception" event');
-like($span, qr/event\.attr=pg\.error\.elevel=21\n/,
-	'event pg.error.elevel matches ERROR (21)');
-like($span, qr/event\.attr=exception\.type=22012\n/,
-	'event exception.type is the SQLSTATE 22012 (division_by_zero)');
-like($span, qr/event\.attr=exception\.message=division by zero/,
-	'event message captures the ereport text');
+# The exception event goes to the innermost non-session span, the SDT
+# bridge's pg.execute, which the bridge discards on abort, so the event
+# is not exported.  The statement span carries ERROR status and the
+# SQLSTATE and message as its status description.
+unlike($span, qr/event\.name=exception\n/,
+	'no exception event on the enclosing statement span');
 like($span, qr/status_description=22012 \/ division by zero/,
 	'status_description is populated with SQLSTATE / message summary');
-like($span, qr/event\.attr=code\.file\.path=\S*\w+\.c/,
-	'event code.file.path is a postgres source file');
 
 # Connection is now in a failed-transaction state; ROLLBACK to clear.
 run_query($sock, 'ROLLBACK');
