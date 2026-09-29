@@ -67,7 +67,6 @@ typedef struct OtelSpanStartArgs
 	OtelSpanParent parent;
 	const OtelSpanContext *parent_ctx;
 	OtelSpanRef parent_span;
-	OtelSpanUnwindPolicy unwind;
 	ResourceOwner owner;
 	bool		detached;
 	bool		scoped;

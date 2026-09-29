@@ -19,10 +19,9 @@
  *
  * Error path: if ExecutorEnd is never reached (an error unwinds past
  * it), the span's resource owner is released on abort and otel_api
- * ends it under its unwind policy (OTEL_UNWIND_ERROR here).  This file
- * does not need its own abort-time span cleanup; it only needs to keep
- * its own bookkeeping stack in sync, which the xact/subxact callbacks
- * below do.
+ * exports it with ERROR status.  This file does not need its own
+ * abort-time span cleanup; it only needs to keep its own bookkeeping
+ * stack in sync, which the xact/subxact callbacks below do.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -77,9 +76,9 @@
  *
  * Entries are removed at the matching end call.  On (sub)transaction
  * abort, entries at or above the aborting nesting level are dropped
- * here too: their spans are ended by otel_api's own resource-owner
- * release (OTEL_UNWIND_ERROR), so this is bookkeeping cleanup only,
- * not span cleanup.
+ * here too: their spans are ended (and exported with ERROR status) by
+ * otel_api's own resource-owner release, so this is bookkeeping
+ * cleanup only, not span cleanup.
  */
 #define OTEL_STMT_STACK_MAX 32
 typedef struct StmtSpanEntry
@@ -319,7 +318,6 @@ start_stmt_span(const char *name, const char *query_text, uint64 query_id)
 		s = otel_span_start(.tracer = &otel_pg_tracer,
 							.name = name,
 							.kind = OTEL_SPAN_KIND_SERVER,
-							.unwind = OTEL_UNWIND_ERROR,
 							.parent = rc.is_set ? OTEL_PARENT_CONTEXT : OTEL_PARENT_ROOT,
 							.parent_ctx = rc.is_set ? &rc.ctx : NULL,
 							.force_sample = otel_trace_all_queries);
@@ -328,7 +326,6 @@ start_stmt_span(const char *name, const char *query_text, uint64 query_id)
 		s = otel_span_start(.tracer = &otel_pg_tracer,
 							.name = name,
 							.kind = OTEL_SPAN_KIND_SERVER,
-							.unwind = OTEL_UNWIND_ERROR,
 							.force_sample = otel_trace_all_queries);
 	if (s.v == 0)
 		return s;
@@ -528,9 +525,9 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	}
 	PG_CATCH();
 	{
-		/* Re-throw; the span (if any) is ended by resource-owner
-		 * release under OTEL_UNWIND_ERROR.  Just keep our own
-		 * bookkeeping consistent. */
+		/* Re-throw; the span (if any) is ended, and exported with
+		 * ERROR status, by resource-owner release.  Just keep our
+		 * own bookkeeping consistent. */
 		if (context == PROCESS_UTILITY_TOPLEVEL)
 			(void) pop_stmt_span(&call_token);
 		PG_RE_THROW();
@@ -547,9 +544,9 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 
 /*
  * XactCallback: keep the bookkeeping stack in sync on abort.  The
- * spans themselves are ended by otel_api's own resource-owner release
- * (OTEL_UNWIND_ERROR), so this only needs to drop stale entries, not
- * emit anything.
+ * spans themselves are ended, and exported with ERROR status, by
+ * otel_api's own resource-owner release, so this only needs to drop
+ * stale entries, not emit anything.
  */
 static void
 otel_pgtracing_xact_callback(XactEvent event, void *arg)

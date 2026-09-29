@@ -52,8 +52,8 @@ typedef struct OtelApiCounters
 
 	uint64		stale_handle;		/* used after end, or foreign */
 	uint64		non_lifo_end;		/* spans ended out of stack order */
-	uint64		unwound_error;		/* ended by owner release, exported as ERROR */
-	uint64		unwound_dropped;	/* ended by owner release, dropped */
+	uint64		unwound;			/* ended by owner release or by an enclosing
+									 * span ending first, exported as ERROR */
 	uint64		leaked_at_commit;
 	uint64		open_at_exit;		/* session spans open at backend exit */
 

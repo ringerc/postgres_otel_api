@@ -255,17 +255,6 @@ kind_from_text(const char *s)
 	return OTEL_SPAN_KIND_INTERNAL;	/* unreachable */
 }
 
-static OtelSpanUnwindPolicy
-unwind_from_text(const char *s)
-{
-	if (strcmp(s, "drop") == 0)
-		return OTEL_UNWIND_DROP;
-	if (strcmp(s, "error") == 0)
-		return OTEL_UNWIND_ERROR;
-	ereport(ERROR, (errmsg("otel_api_conformance: unknown unwind policy \"%s\"", s)));
-	return OTEL_UNWIND_DROP;	/* unreachable */
-}
-
 static OtelSpanParent
 parent_mode_from_text(const char *s)
 {
@@ -799,8 +788,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"start_bad_args\":" UINT64_FORMAT ","
 					  "\"stale_handle\":" UINT64_FORMAT ","
 					  "\"non_lifo_end\":" UINT64_FORMAT ","
-					  "\"unwound_error\":" UINT64_FORMAT ","
-					  "\"unwound_dropped\":" UINT64_FORMAT ","
+					  "\"unwound\":" UINT64_FORMAT ","
 					  "\"leaked_at_commit\":" UINT64_FORMAT ","
 					  "\"open_at_exit\":" UINT64_FORMAT ","
 					  "\"attr_truncated\":" UINT64_FORMAT ","
@@ -816,7 +804,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  c.spans_started, c.spans_unsampled, c.spans_emitted, c.spans_discarded,
 					  c.start_no_slot, c.start_no_session_slot, c.start_stack_full,
 					  c.start_in_crit_section, c.start_bad_args,
-					  c.stale_handle, c.non_lifo_end, c.unwound_error, c.unwound_dropped,
+					  c.stale_handle, c.non_lifo_end, c.unwound,
 					  c.leaked_at_commit, c.open_at_exit,
 					  c.attr_truncated, c.attr_dropped, c.event_dropped, c.link_dropped,
 					  c.error_capture_failed, c.emit_hook_errors,
@@ -847,17 +835,15 @@ otel_api_conformance_start(PG_FUNCTION_ARGS)
 	bytea	   *parent_ctx_bytea = PG_ARGISNULL(4) ? NULL : PG_GETARG_BYTEA_PP(4);
 	bool		have_parent_ref = !PG_ARGISNULL(5);
 	int64		parent_ref_v = have_parent_ref ? PG_GETARG_INT64(5) : 0;
-	char	   *unwind_s = PG_ARGISNULL(6) ? "drop" : text_to_cstring(PG_GETARG_TEXT_PP(6));
-	char	   *owner_mode_s = PG_ARGISNULL(7) ? "default" : text_to_cstring(PG_GETARG_TEXT_PP(7));
-	bool		have_owner_id = !PG_ARGISNULL(8);
-	int64		owner_id = have_owner_id ? PG_GETARG_INT64(8) : 0;
-	bool		detached = PG_ARGISNULL(9) ? false : PG_GETARG_BOOL(9);
-	bool		scoped = PG_ARGISNULL(10) ? false : PG_GETARG_BOOL(10);
+	char	   *owner_mode_s = PG_ARGISNULL(6) ? "default" : text_to_cstring(PG_GETARG_TEXT_PP(6));
+	bool		have_owner_id = !PG_ARGISNULL(7);
+	int64		owner_id = have_owner_id ? PG_GETARG_INT64(7) : 0;
+	bool		detached = PG_ARGISNULL(8) ? false : PG_GETARG_BOOL(8);
+	bool		scoped = PG_ARGISNULL(9) ? false : PG_GETARG_BOOL(9);
 
 	OtelTracer *tracer = (strcmp(producer, "b") == 0) ? &tracer_b : &tracer_a;
 	OtelSpanKind kind = kind_from_text(kind_s);
 	OtelSpanParent parent_mode = parent_mode_from_text(parent_mode_s);
-	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
 	ResourceOwner owner = owner_from_mode(owner_mode_s, have_owner_id, owner_id);
 	OtelSpanContext parent_ctx;
 	bool		have_ctx = false;
@@ -879,7 +865,6 @@ otel_api_conformance_start(PG_FUNCTION_ARGS)
 						 .parent_ctx = (parent_mode == OTEL_PARENT_CONTEXT && have_ctx)
 						 ? &parent_ctx : NULL,
 						 .parent_span = parent_span,
-						 .unwind = unwind,
 						 .owner = owner,
 						 .detached = detached,
 						 .scoped = scoped);
@@ -1240,7 +1225,7 @@ otel_api_conformance_capture_error_scenario(PG_FUNCTION_ARGS)
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	OtelSpanRef s;
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = OTEL_UNWIND_DROP);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 	PG_TRY();
 	{
 		ereport(ERROR,
@@ -1265,7 +1250,7 @@ otel_api_conformance_record_error_scenario(PG_FUNCTION_ARGS)
 	OtelSpanRef s;
 	MemoryContext oldcontext = CurrentMemoryContext;
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = OTEL_UNWIND_DROP);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 	PG_TRY();
 	{
 		ereport(ERROR,
@@ -1301,10 +1286,10 @@ otel_api_conformance_record_error_scenario(PG_FUNCTION_ARGS)
  * Starts a span and ereports at the given level.  For WARNING/LOG this
  * returns normally (the span is ended before returning); for ERROR it
  * propagates, so the caller sees the (sub)transaction abort and the
- * span unwinds under `unwind`.  Exercises both explicit unwind and
- * otel_api's automatic capture of ERRORs that reach the top level via
- * emit_log_hook, into the innermost recording span on the stack (this
- * span, since nothing else is open).
+ * span is exported with ERROR status by resource-owner release.
+ * Exercises otel_api's automatic capture of ERRORs that reach the top
+ * level via emit_log_hook, into the innermost recording span on the
+ * stack (this span, since nothing else is open).
  */
 PG_FUNCTION_INFO_V1(otel_api_conformance_start_and_ereport);
 Datum
@@ -1312,8 +1297,6 @@ otel_api_conformance_start_and_ereport(PG_FUNCTION_ARGS)
 {
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *elevel_s = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *unwind_s = PG_ARGISNULL(2) ? "error" : text_to_cstring(PG_GETARG_TEXT_PP(2));
-	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
 	OtelSpanRef s;
 	int			elevel;
 
@@ -1326,7 +1309,7 @@ otel_api_conformance_start_and_ereport(PG_FUNCTION_ARGS)
 	else
 		ereport(ERROR, (errmsg("otel_api_conformance: unknown elevel \"%s\"", elevel_s)));
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = unwind);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 
 	ereport(elevel, (errmsg("otel_api_conformance test ereport at %s", elevel_s)));
 
@@ -1341,10 +1324,10 @@ otel_api_conformance_start_and_ereport(PG_FUNCTION_ARGS)
  * was built --enable-injection-points AND a TAP test has attached
  * "error" behaviour to "otel_api_conformance-mid-span", the
  * INJECTION_POINT() call below raises ERROR and otel_span_end() is
- * never reached: the span unwinds via its resource owner under
- * OTEL_UNWIND_ERROR.  Otherwise this is a complete no-op scenario; the
- * TAP test is responsible for skipping cleanly when injection points
- * aren't available or don't fire.
+ * never reached: the span is exported with ERROR status by its
+ * resource owner's release.  Otherwise this is a complete no-op
+ * scenario; the TAP test is responsible for skipping cleanly when
+ * injection points aren't available or don't fire.
  */
 PG_FUNCTION_INFO_V1(otel_api_conformance_injection_scenario);
 Datum
@@ -1353,7 +1336,7 @@ otel_api_conformance_injection_scenario(PG_FUNCTION_ARGS)
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	OtelSpanRef s;
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = OTEL_UNWIND_ERROR);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 	INJECTION_POINT("otel_api_conformance-mid-span", NULL);
 	otel_span_end(s);
 	PG_RETURN_VOID();
@@ -1795,11 +1778,11 @@ otel_api_conformance_discard(PG_FUNCTION_ARGS)
  * plpgsql wrapper that calls this function again), and ends the span.
  * If sql raises an ERROR, SPI_execute() propagates it straight through
  * this function -- SPI_finish() and otel_span_end() are never reached,
- * so the span unwinds via whatever resource owner it belongs to (the
- * default: CurrentResourceOwner at the moment otel_span_start() ran),
- * under `unwind`.  That is exactly the plpgsql-recursion pattern this
- * scenario needs: no explicit cleanup code here means the owner/abort
- * machinery is what gets exercised.
+ * so the span is exported with ERROR status by whatever resource owner
+ * it belongs to (the default: CurrentResourceOwner at the moment
+ * otel_span_start() ran).  That is exactly the plpgsql-recursion
+ * pattern this scenario needs: no explicit cleanup code here means the
+ * owner/abort machinery is what gets exercised.
  */
 PG_FUNCTION_INFO_V1(otel_api_conformance_with_span);
 Datum
@@ -1807,12 +1790,10 @@ otel_api_conformance_with_span(PG_FUNCTION_ARGS)
 {
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *unwind_s = PG_ARGISNULL(2) ? "drop" : text_to_cstring(PG_GETARG_TEXT_PP(2));
-	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
 	OtelSpanRef s;
 	int			ret;
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = unwind);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 
 	SPI_connect();
 	ret = SPI_execute(sql, false, 0);
@@ -1842,15 +1823,13 @@ otel_api_conformance_with_span_catch(PG_FUNCTION_ARGS)
 {
 	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *unwind_s = PG_ARGISNULL(2) ? "drop" : text_to_cstring(PG_GETARG_TEXT_PP(2));
-	char	   *after_name = PG_ARGISNULL(3) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(3));
-	OtelSpanUnwindPolicy unwind = unwind_from_text(unwind_s);
+	char	   *after_name = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(2));
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
 	OtelSpanRef s;
 	bool		caught = false;
 
-	s = otel_span_start(.tracer = &tracer_a, .name = name, .unwind = unwind);
+	s = otel_span_start(.tracer = &tracer_a, .name = name);
 
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(oldcxt);
@@ -1876,8 +1855,7 @@ otel_api_conformance_with_span_catch(PG_FUNCTION_ARGS)
 
 	if (after_name != NULL)
 	{
-		OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = after_name,
-										.unwind = unwind);
+		OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = after_name);
 
 		otel_span_set_bool(a, "conformance.caught", caught);
 		otel_span_end(a);
@@ -1999,21 +1977,19 @@ otel_api_conformance_parent_ends_first(PG_FUNCTION_ARGS)
  * while B is still open (non-LIFO).  In a cassert build this trips the
  * same Assert as otel_api_conformance_misuse_non_lifo() (see
  * t/008_misuse.pl) and the backend crashes before reaching the rest of
- * this function; in other builds B is force-unwound under its own
- * policy, A is emitted normally, and D (detached, never touched by the
- * stack-unwind) ends fine afterwards.
+ * this function; in other builds B is force-unwound and exported with
+ * ERROR status, A is emitted normally, and D (detached, never touched
+ * by the stack-unwind) ends fine afterwards.
  */
 PG_FUNCTION_INFO_V1(otel_api_conformance_mixed_non_lifo_detached);
 Datum
 otel_api_conformance_mixed_non_lifo_detached(PG_FUNCTION_ARGS)
 {
-	OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.A",
-									 .unwind = OTEL_UNWIND_ERROR);
+	OtelSpanRef a = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.A");
 	OtelSpanRef d = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.D",
 									 .parent = OTEL_PARENT_SPAN, .parent_span = a,
 									 .detached = true);
-	OtelSpanRef b = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.B",
-									 .unwind = OTEL_UNWIND_ERROR);
+	OtelSpanRef b = otel_span_start(.tracer = &tracer_a, .name = "conformance.c.B");
 
 	otel_span_end(a);			/* non-LIFO: B is still open above A */
 	otel_span_end(b);			/* stale handle: B was already force-unwound */
@@ -2532,8 +2508,7 @@ otel_api_conformance_stress_ops(PG_FUNCTION_ARGS)
 					  ",\"spans_discarded_delta\":" UINT64_FORMAT
 					  ",\"stale_handle_delta\":" UINT64_FORMAT
 					  ",\"non_lifo_end_delta\":" UINT64_FORMAT
-					  ",\"unwound_error_delta\":" UINT64_FORMAT
-					  ",\"unwound_dropped_delta\":" UINT64_FORMAT
+					  ",\"unwound_delta\":" UINT64_FORMAT
 					  "}",
 					  n_ops, n_started, n_ended, n_discarded, n_set_attr, n_events,
 					  parent_checked, parent_mismatches,
@@ -2543,8 +2518,7 @@ otel_api_conformance_stress_ops(PG_FUNCTION_ARGS)
 					  c_after.spans_discarded - c_before.spans_discarded,
 					  c_after.stale_handle - c_before.stale_handle,
 					  c_after.non_lifo_end - c_before.non_lifo_end,
-					  c_after.unwound_error - c_before.unwound_error,
-					  c_after.unwound_dropped - c_before.unwound_dropped);
+					  c_after.unwound - c_before.unwound);
 
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
 }

@@ -21,8 +21,10 @@
  *
  * The span machinery is the same as otel_fdw.c: a fixed-depth stack keyed by
  * the PlanState pointer so ends can be matched non-LIFO, plus (sub)xact-abort
- * cleanup (planspans_subxact_abort / planspans_reset).  Spans use
- * OTEL_UNWIND_DROP (span_init default) so static storage is safe.
+ * cleanup (planspans_subxact_abort / planspans_reset).  A span abandoned by
+ * abort is exported with ERROR status by otel_api's own resource-owner
+ * release; every attribute is copied into the span at set time, so nothing
+ * here dereferences the (possibly already-freed) PlanState during export.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -270,8 +272,9 @@ otel_planspans_subxact_abort(SubXactEvent event)
 }
 
 /*
- * Reset on top-level transaction abort.  The spans are dropped by the otel_api
- * MemoryContext callbacks during error unwind; we just clear our depth counter.
+ * Reset on top-level transaction abort.  The spans are ended (exported with
+ * ERROR status) by otel_api's own resource-owner release during error
+ * unwind; we just clear our depth counter.
  */
 void
 otel_planspans_reset(void)

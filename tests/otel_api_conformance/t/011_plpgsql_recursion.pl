@@ -7,7 +7,7 @@
 # block, hit core's own "stack depth limit exceeded", and run
 # unsampled.  Task brief "1. plpgsql recursion".
 #
-# otel_api_conformance_with_span(name, sql, unwind) is the C helper: it
+# otel_api_conformance_with_span(name, sql) is the C helper: it
 # starts a span, runs `sql` via SPI (which may recurse straight back
 # into a plpgsql wrapper that calls this function again), and ends the
 # span -- so the span's lifetime spans the whole recursive call below
@@ -67,12 +67,11 @@ BEGIN
 		PERFORM otel_api_conformance_with_span_catch('level_' || level,
 			format('SELECT conformance_recurse(%s,%s,%s,%L)',
 				level + 1, max_depth, catch_level, raise_at_bottom),
-			'error', 'level_' || level || '_after_catch');
+			'level_' || level || '_after_catch');
 	ELSE
 		PERFORM otel_api_conformance_with_span('level_' || level,
 			format('SELECT conformance_recurse(%s,%s,%s,%L)',
-				level + 1, max_depth, catch_level, raise_at_bottom),
-			'error');
+				level + 1, max_depth, catch_level, raise_at_bottom));
 	END IF;
 END;
 $BODY$ LANGUAGE plpgsql;
@@ -83,8 +82,7 @@ RETURNS void AS $BODY$
 BEGIN
 	PERFORM otel_api_conformance_with_span('level_1',
 		format('SELECT conformance_recurse(2,%s,%s,%L)',
-			max_depth, catch_level, raise_at_bottom),
-		'error');
+			max_depth, catch_level, raise_at_bottom));
 END;
 $BODY$ LANGUAGE plpgsql;
 SQL
@@ -258,9 +256,9 @@ SQL
 
 # ----------------------------------------------------------------
 # (d) Recursion until max_stack_depth is exceeded (SQLSTATE 54001):
-# every recorded span is unwound (ERROR policy -> emitted with ERROR
-# status), the innermost carries exception.type 54001 via automatic
-# capture, backend healthy and clean afterwards.
+# every recorded span is unwound, exported with ERROR status, the
+# innermost carries exception.type 54001 via automatic capture, backend
+# healthy and clean afterwards.
 # ----------------------------------------------------------------
 {
 	# Everything -- the failing recursion AND the read-back -- must be
@@ -300,7 +298,7 @@ SQL
 	# exhausted deeper down.
 	is(scalar(@s), 64, '(d) exactly 64 spans recorded (bound by max_open_spans, not the stack itself)');
 	is($c->{spans_started}, 64, '(d) spans_started counter agrees');
-	is($c->{unwound_error}, 64, '(d) all 64 are unwound under the ERROR policy');
+	is($c->{unwound}, 64, '(d) all 64 are unwound and exported with ERROR status');
 	is(scalar(grep { $_->{status} != 2 } @s), 0,
 		'(d) no recorded span escapes with a non-ERROR status');
 	my ($innermost) = sort { $b->{start_time} <=> $a->{start_time} } @s;
@@ -402,12 +400,11 @@ BEGIN
 		PERFORM otel_api_conformance_with_span_catch('level_' || level,
 			format('SELECT conformance_recurse(%s,%s,%s,%L)',
 				level + 1, max_depth, catch_level, raise_at_bottom),
-			'error', 'level_' || level || '_after_catch');
+			'level_' || level || '_after_catch');
 	ELSE
 		PERFORM otel_api_conformance_with_span('level_' || level,
 			format('SELECT conformance_recurse(%s,%s,%s,%L)',
-				level + 1, max_depth, catch_level, raise_at_bottom),
-			'error');
+				level + 1, max_depth, catch_level, raise_at_bottom));
 	END IF;
 END;
 $BODY$ LANGUAGE plpgsql;
@@ -418,8 +415,7 @@ RETURNS void AS $BODY$
 BEGIN
 	PERFORM otel_api_conformance_with_span('level_1',
 		format('SELECT conformance_recurse(2,%s,%s,%L)',
-			max_depth, catch_level, raise_at_bottom),
-		'error');
+			max_depth, catch_level, raise_at_bottom));
 END;
 $BODY$ LANGUAGE plpgsql;
 SQL

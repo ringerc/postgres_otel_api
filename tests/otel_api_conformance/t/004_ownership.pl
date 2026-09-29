@@ -82,16 +82,17 @@ SQL
 
 {
 	# Leave the span open; releasing the owner with do_commit=false
-	# should unwind it (drop, by explicit policy) rather than emit it.
+	# unwinds it, exporting it with ERROR status, rather than committing it.
 	my $out = $node->safe_psql('postgres', <<'SQL');
 SELECT otel_api_conformance_create_owner('conformance.custom_owner2') AS oid \gset
-SELECT otel_api_conformance_start('conformance.custom_abort', owner_mode => 'custom', owner_id => :oid, detached => true, unwind => 'drop') AS s \gset
+SELECT otel_api_conformance_start('conformance.custom_abort', owner_mode => 'custom', owner_id => :oid, detached => true) AS s \gset
 SELECT otel_api_conformance_release_owner(:oid, false) AS r \gset
 SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SQL
 	my @s = parse_spans($out);
-	is(scalar(grep { $_->{name} eq 'conformance.custom_abort' } @s), 0,
-		'releasing a custom owner with do_commit=false unwinds (drops) an open span');
+	my ($span) = grep { $_->{name} eq 'conformance.custom_abort' } @s;
+	ok($span, 'releasing a custom owner with do_commit=false unwinds an open span, exporting it');
+	is($span->{status}, 2, 'ERROR status on a custom-owner unwind') if $span;
 }
 
 # ----------------------------------------------------------------

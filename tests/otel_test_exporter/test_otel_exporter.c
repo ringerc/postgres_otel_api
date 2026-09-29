@@ -598,8 +598,8 @@ test_otel_set_policy(PG_FUNCTION_ARGS)
  * test_otel_producer_roundtrip(name text) → text
  *
  * Exercises the producer-side API end-to-end in a single SQL call:
- * otel_span_start (with an explicit unwind policy) → otel_span_set_str
- * ×2 → otel_span_add_event → otel_span_set_status → otel_span_end.
+ * otel_span_start → otel_span_set_str ×2 → otel_span_add_event →
+ * otel_span_set_status → otel_span_end.
  *
  * Returns the generated span_id (hex) so the TAP test can correlate
  * it with what the emit-hook captures.
@@ -628,8 +628,7 @@ test_otel_producer_roundtrip(PG_FUNCTION_ARGS)
 
 	s = otel_span_start(.tracer = &test_tracer,
 					   .name = name,
-					   .kind = OTEL_SPAN_KIND_INTERNAL,
-					   .unwind = OTEL_UNWIND_DROP);
+					   .kind = OTEL_SPAN_KIND_INTERNAL);
 	if (s.v == 0)
 		ereport(ERROR,
 				(errmsg("test_otel_producer_roundtrip: otel_span_start returned OTEL_SPAN_NONE "

@@ -227,14 +227,15 @@ Fully worked examples:
 <details>
 <summary><b>Produce spans from your own extension</b> — instrument
 best-effort sub-spans; if ereport(ERROR) unwinds past span_emit, the
-span is silently dropped</summary>
+span is exported with ERROR status</summary>
 
-The default unwind policy is `OTEL_UNWIND_DROP`: `otel_api` registers
-a `MemoryContextCallback` at push time, so the stack entry is popped
-cleanly during ereport unwind and no phantom span is emitted. The
-`OtelSpan` allocation can safely live on the C stack — under DROP
-the stack entry stores NULL for the borrowed pointer, so there is
-structurally no dangling-pointer hazard.
+`otel_api` owns all span storage, so a span abandoned by an
+ereport(ERROR) unwind is never silently lost: `otel_api` registers a
+`MemoryContextCallback` at push time, and that callback exports the
+span with `OTEL_STATUS_ERROR` during ereport unwind. Because every
+string and attribute is copied into `otel_api`'s own storage as it is
+set, this is memory-safe regardless of where the `OtelSpan` allocation
+itself lives, including the C stack.
 
 ```c
 #include <otel_api/otel_api.h>    /* includes otel.h + lazy getter */
@@ -271,10 +272,9 @@ do_traced_work(const char *target)
 }
 ```
 
-Use this shape for sub-spans inside a larger traced operation where
-losing a span on error is preferable to emitting a half-populated one.
-For statement-level spans where an aborted operation should still
-appear in the trace, see the next entry.
+Use this shape for sub-spans inside a larger traced operation; an
+aborted operation still appears in the trace, exported with ERROR
+status, as does the statement-level span in the next entry.
 
 Fully worked example:
 
@@ -285,19 +285,16 @@ Fully worked example:
 </details>
 
 <details>
-<summary><b>Produce spans that capture and record errors</b> — opt
-into OTEL_UNWIND_ERROR so an ereport(ERROR) emits the span with
-status=ERROR rather than dropping it</summary>
+<summary><b>Produce spans that capture and record errors</b> — an
+ereport(ERROR) unwind always emits the span with status=ERROR</summary>
 
-`OTEL_UNWIND_ERROR` upgrades the safety net: on ereport unwind the
-callback still pops the stack entry, but it also sets the span's
+On ereport unwind the callback pops the stack entry, sets the span's
 status to `OTEL_STATUS_ERROR`, fills in `end_time = now` and a
-description from the unwind, and dispatches the span to registered
-exporters. This requires the `OtelSpan` allocation to outlive the
-unwind because the callback dereferences the borrowed pointer — a
-pure on-stack span is **not** safe under this policy. Use a
-`MemoryContext`-allocated span, a static slab, or another
-unwind-surviving location.
+description from the unwind (or from the captured error, if any), and
+dispatches the span to registered exporters. This is memory-safe
+regardless of where the `OtelSpan` allocation itself lives, because
+every string and attribute was already copied into `otel_api`'s own
+storage when it was set.
 
 Equally important: `CurrentMemoryContext` at the moment of the
 push *is* the unwind scope. The `MemoryContextResetCallback` is
@@ -307,9 +304,9 @@ per-statement / per-executor context you're in; if you need a
 different scope, `MemoryContextSwitchTo` before pushing (the
 binding is captured at push time; later switches don't move it).
 Pushing under `TopMemoryContext`, `CacheMemoryContext`, or
-`ErrorContext` with `OTEL_UNWIND_ERROR` logs a server-side `LOG`
-message and asserts in cassert builds — those contexts don't reset
-on ereport, so the safety net would never fire.
+`ErrorContext` logs a server-side `LOG` message and asserts in
+cassert builds — those contexts don't reset on ereport, so the
+safety net would never fire.
 
 ```c
 #include <otel_api/otel_api.h>    /* includes otel.h + lazy getter */
@@ -332,13 +329,14 @@ do_traced_work(const char *target)
     if (my_scope == NULL)
         my_scope = api->tracer_register("my_extension", MY_VERSION, NULL);
 
-    /* Must outlive the unwind: palloc'd here, but a static slab
-     * (cf. otel_postgres_tracing's span_storage) works too. */
+    /* palloc'd here, but a static slab (cf. otel_postgres_tracing's
+     * span_storage) works too -- otel_api copies everything it needs
+     * out of *span at push time, so nothing here needs to outlive
+     * the unwind itself. */
     span = MemoryContextAlloc(CurrentMemoryContext, sizeof(OtelSpan));
 
     api->span_init(span, my_scope, "my_extension.do_work",
                    OTEL_SPAN_KIND_INTERNAL);
-    otel_span_set_unwind_policy(span, OTEL_UNWIND_ERROR);
 
     api->span_link_to_active_and_push(span);
     api->span_add_attribute_string(span, "my.target", target);
@@ -356,9 +354,9 @@ Fully worked example:
 
 * [`otel_postgres_tracing/otel_trace.c`](otel_postgres_tracing/otel_trace.c)
   — statement-level instrumentation: span_storage is a static slab,
-  `unwind_policy = OTEL_UNWIND_ERROR`, spans linked to the
-  propagated client context, attributes for `db.system` /
-  `db.statement` / `db.user`, parallel-worker leader publishing.
+  spans linked to the propagated client context, attributes for
+  `db.system` / `db.statement` / `db.user`, parallel-worker leader
+  publishing.
 
 </details>
 

@@ -33,7 +33,7 @@
  * --------
  * Every recording span is remembered by a resource owner (by default
  * CurrentResourceOwner), or is a session span.  Owner release on abort
- * ends the span under its unwind policy.  Owner release on commit with
+ * exports the span with ERROR status.  Owner release on commit with
  * the span still open is a leak: core calls the DebugPrint callback just
  * before ReleaseResource, only in that case, which is how the two are
  * told apart.  Non-recording entries are dropped by subtransaction and
@@ -99,7 +99,6 @@ typedef struct OtelSlot
 	bool		session;
 	bool		leaked;			/* set by DebugPrint on commit release */
 	bool		dispatching;
-	OtelSpanUnwindPolicy unwind;
 	ResourceOwner owner;		/* NULL for a session span */
 	void	   *scope_frame;	/* cassert: an address in the start frame */
 
@@ -691,9 +690,9 @@ slot_record_error(OtelSlot *slot, const ErrorData *edata)
 
 /*
  * emit_log_hook: record WARNING and worse into the innermost recording
- * span.  An ERROR is also recorded into every other OTEL_UNWIND_ERROR
- * span on the stack that isn't a session span: the abort that follows
- * ends them, and they should say why.
+ * span.  An ERROR is also recorded into every other span on the stack
+ * that isn't a session span: the abort that follows ends them too, and
+ * they should say why.
  *
  * This runs for errors that reach EmitErrorReport, which for a top-level
  * ERROR is before transaction abort releases the spans.  Errors caught
@@ -714,8 +713,7 @@ otel_emit_log_hook(ErrorData *edata)
 			if (e < 0 || slots[e].dispatching)
 				continue;
 			if (innermost ||
-				(edata->elevel >= ERROR && slots[e].unwind == OTEL_UNWIND_ERROR &&
-				 !slots[e].session))
+				(edata->elevel >= ERROR && !slots[e].session))
 				slot_record_error(&slots[e], edata);
 			innermost = false;
 			if (edata->elevel < ERROR)
@@ -813,46 +811,34 @@ dispatch_span(const OtelSpan *span)
 }
 
 /*
- * End the span in slot idx: export it (unless it's an unwound DROP span)
- * and free the slot.  The caller has taken it off the active stack.
- * unwinding means the span didn't reach otel_span_end(): it is exported
- * with ERROR status under OTEL_UNWIND_ERROR, else dropped.
+ * End the span in slot idx: export it and free the slot.  The caller
+ * has taken it off the active stack.  unwinding means the span didn't
+ * reach otel_span_end(): it is exported with ERROR status, since
+ * storage is owned by otel_api and exporting is always memory-safe.
  */
 static void
 end_slot(int idx, TimestampTz end_time, bool unwinding, const char *unwind_reason)
 {
 	OtelSlot   *slot = &slots[idx];
-	bool		emit = true;
 
 	Assert(!slot->dispatching);
 	if (unwinding)
 	{
-		if (slot->unwind == OTEL_UNWIND_ERROR)
-		{
-			slot->span.status = OTEL_STATUS_ERROR;
-			if (!slot->err.used && slot->span.status_description == NULL)
-				slot->span.status_description = unwind_reason;
-			otel_counters.unwound_error++;
-		}
-		else
-		{
-			emit = false;
-			otel_counters.unwound_dropped++;
-		}
+		slot->span.status = OTEL_STATUS_ERROR;
+		if (!slot->err.used && slot->span.status_description == NULL)
+			slot->span.status_description = unwind_reason;
+		otel_counters.unwound++;
 	}
 
-	if (emit)
-	{
-		slot->span.end_time = end_time ? end_time : GetCurrentTimestamp();
-		if (slot->err.used)
-			lower_error_event(slot);
-		slot->span.attrs = slot->attrs;
-		slot->span.events = slot->events;
-		slot->span.links = slot->links;
-		slot->dispatching = true;
-		dispatch_span(&slot->span);
-		slot->dispatching = false;
-	}
+	slot->span.end_time = end_time ? end_time : GetCurrentTimestamp();
+	if (slot->err.used)
+		lower_error_event(slot);
+	slot->span.attrs = slot->attrs;
+	slot->span.events = slot->events;
+	slot->span.links = slot->links;
+	slot->dispatching = true;
+	dispatch_span(&slot->span);
+	slot->dispatching = false;
 	release_slot(idx, false);
 }
 
@@ -1145,7 +1131,6 @@ api_span_start(const OtelSpanStartArgs *args)
 	slot->gen = next_gen();
 	slot->detached = args->detached;
 	slot->session = session;
-	slot->unwind = args->unwind;
 	slot->owner = owner;
 	slot->attrs = slot->inline_attrs;
 	slot->attrs_cap = OTEL_SLOT_INLINE_ATTRS;
@@ -1775,7 +1760,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 		F(spans_started), F(spans_unsampled), F(spans_emitted), F(spans_discarded),
 		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
 		F(start_in_crit_section), F(start_bad_args),
-		F(stale_handle), F(non_lifo_end), F(unwound_error), F(unwound_dropped),
+		F(stale_handle), F(non_lifo_end), F(unwound),
 		F(leaked_at_commit), F(open_at_exit),
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),
 		F(error_capture_failed), F(emit_hook_errors),

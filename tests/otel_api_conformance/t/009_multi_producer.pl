@@ -82,8 +82,8 @@ SQL
 
 # ----------------------------------------------------------------
 # Out-of-LIFO order: producer a starts, producer b starts nested, but
-# a ends first (while b is still open).  Ending an outer span unwinds
-# the ones above it under their own policy, with a WARNING -- and, per
+# a ends first (while b is still open).  Ending an outer span exports
+# the ones above it with ERROR status, with a WARNING -- and, per
 # otel_producer.h's documented rules, an Assert in cassert builds (this
 # is the same check otel_api_conformance_misuse_non_lifo() exercises in
 # t/008_misuse.pl; here it's the same situation arising incidentally
@@ -117,22 +117,24 @@ SQL
 
 # ----------------------------------------------------------------
 # One producer erroring while the other has an open span: a's
-# toptxn-owned span (unwind=drop) is dropped when the whole
-# transaction later rolls back; b's error-scenario span is
-# self-contained (started, errored, captured and ended all within its
-# own single statement) and was already emitted well before that.
+# toptxn-owned span is still open when the whole transaction later
+# rolls back, so it is exported with ERROR status; b's error-scenario
+# span is self-contained (started, errored, captured and ended all
+# within its own single statement) and was already emitted well before
+# that.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
 BEGIN;
-SELECT otel_api_conformance_start('conformance.a3', producer => 'a', owner_mode => 'toptxn', unwind => 'drop') AS a3 \gset
+SELECT otel_api_conformance_start('conformance.a3', producer => 'a', owner_mode => 'toptxn') AS a3 \gset
 SELECT otel_api_conformance_capture_error_scenario('conformance.b3_captured') AS r \gset
 ROLLBACK;
 SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SQL
 	my @s = parse_spans($out);
-	is(scalar(grep { $_->{name} eq 'conformance.a3' } @s), 0,
-		"producer a's open span (unwind=drop) is discarded on the transaction abort");
+	my ($a3) = grep { $_->{name} eq 'conformance.a3' } @s;
+	ok($a3, "producer a's still-open span is exported when the transaction aborts");
+	is($a3->{status}, 2, 'ERROR status on the unwound span') if $a3;
 	ok((grep { $_->{name} eq 'conformance.b3_captured' } @s),
 		"producer b's explicitly-ended, error-captured span was emitted before the abort");
 }

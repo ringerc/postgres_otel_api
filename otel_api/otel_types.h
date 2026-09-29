@@ -83,22 +83,6 @@ typedef enum OtelSpanStatus
 } OtelSpanStatus;
 
 /*
- * What happens to a span that is ended by its resource owner being
- * released on abort, instead of by an explicit otel_span_end().
- *
- *	 OTEL_UNWIND_DROP (default): discarded, never exported.
- *	 OTEL_UNWIND_ERROR: exported with ERROR status.  If the error was
- *		captured (automatically, or by otel_span_capture_error() in
- *		PG_CATCH) the span carries it; otherwise it gets a fixed
- *		description.
- */
-typedef enum OtelSpanUnwindPolicy
-{
-	OTEL_UNWIND_DROP = 0,
-	OTEL_UNWIND_ERROR = 1,
-} OtelSpanUnwindPolicy;
-
-/*
  * InstrumentationScope: which producer created a span.  Obtained once per
  * producer from the tracer_register entry point and cached.  Owned by
  * otel_api; valid for the backend's lifetime.

@@ -340,10 +340,10 @@ otel_fdw_subxact_abort(SubXactEvent event)
 }
 
 /*
- * Reset on top-level transaction abort.  The FDW scan spans are dropped by
- * the otel_api MemoryContext callbacks during error unwind; we just clear our
- * depth counter so the next transaction starts clean.  Applies to both
- * strategies.
+ * Reset on top-level transaction abort.  The FDW scan spans are ended
+ * (exported with ERROR status) by otel_api's own resource-owner release
+ * during error unwind; we just clear our depth counter so the next
+ * transaction starts clean.  Applies to both strategies.
  */
 void
 otel_fdw_reset(void)

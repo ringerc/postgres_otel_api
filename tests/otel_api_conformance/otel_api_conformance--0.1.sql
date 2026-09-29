@@ -27,7 +27,7 @@ AS 'MODULE_PATHNAME', 'otel_api_conformance_sampler_calls'
 LANGUAGE C VOLATILE STRICT;
 
 -- ----------------------------------------------------------------
--- Producer side: construction, parentage, ownership, unwind.
+-- Producer side: construction, parentage, ownership.
 -- ----------------------------------------------------------------
 
 CREATE FUNCTION otel_api_conformance_start(
@@ -37,7 +37,6 @@ CREATE FUNCTION otel_api_conformance_start(
 	parent_mode text DEFAULT 'active',
 	parent_ctx bytea DEFAULT NULL,
 	parent_ref bigint DEFAULT NULL,
-	unwind text DEFAULT 'drop',
 	owner_mode text DEFAULT 'default',
 	owner_id bigint DEFAULT NULL,
 	detached boolean DEFAULT false,
@@ -151,7 +150,7 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_record_error_scenario'
 LANGUAGE C VOLATILE STRICT;
 
-CREATE FUNCTION otel_api_conformance_start_and_ereport(name text, elevel text, unwind text DEFAULT 'error')
+CREATE FUNCTION otel_api_conformance_start_and_ereport(name text, elevel text)
 RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_start_and_ereport'
 LANGUAGE C VOLATILE;
@@ -292,13 +291,13 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_discard'
 LANGUAGE C VOLATILE STRICT;
 
-CREATE FUNCTION otel_api_conformance_with_span(name text, sql text, unwind text DEFAULT 'drop')
+CREATE FUNCTION otel_api_conformance_with_span(name text, sql text)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'otel_api_conformance_with_span'
 LANGUAGE C VOLATILE;
 
 CREATE FUNCTION otel_api_conformance_with_span_catch(name text, sql text,
-	unwind text DEFAULT 'drop', after_name text DEFAULT NULL)
+	after_name text DEFAULT NULL)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'otel_api_conformance_with_span_catch'
 LANGUAGE C VOLATILE;

@@ -1,10 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
-# Error paths: ERROR vs DROP unwind on top-level and subtransaction
-# abort; otel_span_capture_error / otel_span_record_error in PG_CATCH;
-# automatic top-level ERROR capture; ERROR injected between start and
-# end via injection_points (skipped cleanly if unavailable).  otel_api
-# P2 design, "Conformance test suite" > "Error paths".
+# Error paths: a span ended by its resource owner's release on abort is
+# always exported with ERROR status, on top-level and subtransaction
+# abort alike; otel_span_capture_error / otel_span_record_error in
+# PG_CATCH; automatic top-level ERROR capture; ERROR injected between
+# start and end via injection_points (skipped cleanly if unavailable).
+# otel_api P2 design, "Conformance test suite" > "Error paths".
 #
 # Test-writing note: a span's default owner is the CURRENT STATEMENT's
 # own portal.  A bare "SELECT otel_api_conformance_start(...);" followed
@@ -59,7 +60,7 @@ SELECT otel_api_conformance_capture_error_scenario('conformance.captured_error')
 SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SQL
 	my @s = parse_spans($out);
-	is(scalar(@s), 1, 'captured-error span was emitted (unwind=DROP, but explicitly ended)');
+	is(scalar(@s), 1, 'captured-error span was emitted (explicitly ended)');
 	my $span = $s[0];
 	is($span->{status}, 2, 'status is OTEL_STATUS_ERROR (2)');
 	my ($ev) = grep { $_->{name} eq 'exception' } @{ $span->{events} };
@@ -88,8 +89,8 @@ SQL
 # ----------------------------------------------------------------
 # Automatic capture of a top-level ERROR: a WARNING/LOG-level ereport
 # does not abort, and the span ends normally.  An ERROR-level ereport
-# aborts the statement (and hence its own default-owned span); with
-# unwind=error the span is still emitted, with ERROR status.
+# aborts the statement (and hence its own default-owned span); the
+# span is still emitted, by resource-owner release, with ERROR status.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
@@ -102,11 +103,11 @@ SQL
 }
 
 {
-	# unwind=error: the span is not explicitly ended (ERROR aborts its
-	# own statement/portal first), but otel_api's ResourceOwnerDesc
-	# release on that abort emits it under OTEL_UNWIND_ERROR.  One
-	# connection throughout: on_error_stop => 0 so the read-back after
-	# the expected error still runs.
+	# The span is not explicitly ended (ERROR aborts its own
+	# statement/portal first), but otel_api's ResourceOwnerDesc release
+	# on that abort exports it with ERROR status.  One connection
+	# throughout: on_error_stop => 0 so the read-back after the
+	# expected error still runs.
 	my ($ret, $stdout, $stderr) = $node->psql(
 		'postgres', <<'SQL',
 SELECT otel_api_conformance_start_and_ereport('conformance.errored', 'error');
@@ -119,32 +120,20 @@ SQL
 	my ($spans_line, $counters_line) = split /\n/, $stdout, 2;
 	my @s = parse_spans($spans_line);
 	my ($span) = grep { $_->{name} eq 'conformance.errored' } @s;
-	ok($span, 'unwind=error emits the span on its own statement abort');
-	is($span->{status}, 2, 'unwound-on-error span has ERROR status') if $span;
+	ok($span, 'the span is exported on its own statement abort');
+	is($span->{status}, 2, 'unwound span has ERROR status') if $span;
 	my $c = decode_json($counters_line);
-	cmp_ok($c->{unwound_error}, '>=', 1, 'unwound_error counter increased');
+	cmp_ok($c->{unwound}, '>=', 1, 'unwound counter increased');
 }
 
 # ----------------------------------------------------------------
 # Top-level (real) transaction abort: a longer-lived (toptxn-owned)
-# span, dropped or emitted per its unwind policy.
+# span, still open, is exported with ERROR status.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
 BEGIN;
-SELECT otel_api_conformance_start('conformance.toptxn_dropped', owner_mode => 'toptxn', unwind => 'drop') AS s1 \gset
-ROLLBACK;
-SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
-SQL
-	my @s = parse_spans($out);
-	is(scalar(grep { $_->{name} eq 'conformance.toptxn_dropped' } @s), 0,
-		'unwind=drop: a toptxn-owned span is discarded on real ROLLBACK');
-}
-
-{
-	my $out = $node->safe_psql('postgres', <<'SQL');
-BEGIN;
-SELECT otel_api_conformance_start('conformance.toptxn_errored', owner_mode => 'toptxn', unwind => 'error') AS s1 \gset
+SELECT otel_api_conformance_start('conformance.toptxn_errored', owner_mode => 'toptxn') AS s1 \gset
 ROLLBACK;
 SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SELECT otel_api_conformance_counters();
@@ -152,10 +141,10 @@ SQL
 	my ($spans_line, $counters_line) = split /\n/, $out, 2;
 	my @s = parse_spans($spans_line);
 	my ($span) = grep { $_->{name} eq 'conformance.toptxn_errored' } @s;
-	ok($span, 'unwind=error: a toptxn-owned span is emitted on real ROLLBACK');
+	ok($span, 'a toptxn-owned span is emitted on real ROLLBACK');
 	is($span->{status}, 2, 'ERROR status on ROLLBACK unwind') if $span;
 	my $c = decode_json($counters_line);
-	cmp_ok($c->{unwound_error}, '>=', 1, 'unwound_error counter increased');
+	cmp_ok($c->{unwound}, '>=', 1, 'unwound counter increased');
 }
 
 # ----------------------------------------------------------------
@@ -169,7 +158,7 @@ SQL
 DO $$
 BEGIN
 	BEGIN
-		PERFORM otel_api_conformance_start('conformance.plpgsql_caught', owner_mode => 'default', unwind => 'error');
+		PERFORM otel_api_conformance_start('conformance.plpgsql_caught', owner_mode => 'default');
 		RAISE EXCEPTION 'conformance induced plpgsql error';
 	EXCEPTION WHEN OTHERS THEN
 		NULL;
@@ -180,7 +169,7 @@ SELECT jsonb_agg(s) FROM otel_api_conformance_spans() s;
 SQL
 	my @s = parse_spans($out);
 	my ($span) = grep { $_->{name} eq 'conformance.plpgsql_caught' } @s;
-	ok($span, 'span started inside a plpgsql EXCEPTION block is emitted on unwind (block-local abort)');
+	ok($span, 'span started inside a plpgsql EXCEPTION block is emitted (block-local abort)');
 	is($span->{status}, 2, 'ERROR status on plpgsql-block unwind') if $span;
 }
 
@@ -226,7 +215,7 @@ SQL
 		{
 			my @s = parse_spans($stdout);
 			my ($span) = grep { $_->{name} eq 'conformance.injected' } @s;
-			ok($span, 'span unwinds via OTEL_UNWIND_ERROR when the injected error aborts the subxact');
+			ok($span, 'span is exported with ERROR status when the injected error aborts the subxact');
 			is($span->{status}, 2, 'ERROR status on injected abort') if $span;
 		}
 		$node->safe_psql('postgres',

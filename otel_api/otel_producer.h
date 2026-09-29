@@ -9,8 +9,7 @@
  *	   static OtelTracer my_tracer = {.name = "my_ext", .version = "1.0"};
  *
  *	   OtelSpanRef s = otel_span_start(.tracer = &my_tracer,
- *									   .name = "my_ext.work",
- *									   .unwind = OTEL_UNWIND_ERROR);
+ *									   .name = "my_ext.work");
  *	   otel_span_set_int(s, "my_ext.rows", nrows);
  *	   ... work ...
  *	   otel_span_end(s);
@@ -32,8 +31,8 @@
  *	 - A handle is dead after otel_span_end().  Using it again is a no-op
  *	   that is counted, and fails an Assert in cassert builds.
  *	 - Spans on the active stack should end in LIFO order.  Ending a span
- *	   with others above it ends those first (each under its own unwind
- *	   policy), with a WARNING, and fails an Assert in cassert builds.
+ *	   with others above it ends those first, each exported with ERROR
+ *	   status, with a WARNING, and fails an Assert in cassert builds.
  *	 - So a span on the active stack must end within the call that started
  *	   it (or a callee), not in a later SQL statement.  Other producers
  *	   push spans of their own in between: otel_postgres_tracing wraps
@@ -43,7 +42,7 @@
  *
  * Lifetime.  Every recording span belongs to a resource owner: by default
  * CurrentResourceOwner, or the one given in .owner.  When the owner is
- * released on abort, the span ends under its unwind policy.  When it is
+ * released on abort, the span is exported with ERROR status.  When it is
  * released on commit with the span still open, that is a leak: core
  * prints "resource was not closed", otel_api counts it, and the span is
  * dropped.  With no resource owner (outside a transaction, e.g. in a
@@ -139,7 +138,6 @@ typedef struct OtelSpanStartArgs
 	OtelSpanParent parent;
 	const OtelSpanContext *parent_ctx;
 	OtelSpanRef parent_span;
-	OtelSpanUnwindPolicy unwind;
 
 	/*
 	 * NULL: CurrentResourceOwner, or the session if there is none.

@@ -38,11 +38,10 @@
  *	   probe pairs are not strictly nested (interleaved sorts, utility-
  *	   with-executor statements); an out-of-order end there is handled by
  *	   otel_api itself (it unwinds the spans above the one actually being
- *	   ended, each under its own unwind policy, with a WARNING).  All of
- *	   this bridge's per-statement spans use OTEL_UNWIND_DROP, so an
- *	   out-of-order emit there only drops sibling bridge spans and never
- *	   corrupts the enclosing OTEL_UNWIND_ERROR statement span from
- *	   otel_trace.c.
+ *	   ended, each exported with ERROR status, with a WARNING).  So an
+ *	   out-of-order emit among this bridge's per-statement spans exports
+ *	   the out-of-order sibling(s) with ERROR status and never corrupts
+ *	   the enclosing statement span from otel_trace.c.
  *
  * This is DEMO-quality code.
  *
@@ -457,7 +456,6 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 										   .name = "pg.txn",
 										   .kind = OTEL_SPAN_KIND_INTERNAL,
 										   .parent = OTEL_PARENT_ROOT,
-										   .unwind = OTEL_UNWIND_ERROR,
 										   .owner = TopTransactionResourceOwner,
 										   .detached = true);
 				otel_span_set_str(txn_span, OTEL_PG_SPAN_SOURCE,
@@ -779,11 +777,11 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	 * SDT start/done pairs are LIFO in the common case so our span is the
 	 * top; for the few that are not strictly nested (interleaved sorts, or
 	 * a utility statement such as CREATE TABLE AS that runs an executor
-	 * underneath) otel_api unwinds the entries above ours, each honouring
-	 * its own unwind_policy.  All bridge spans are OTEL_UNWIND_DROP, so an
-	 * out-of-order emit there only drops sibling bridge spans (plus a
-	 * benign WARNING) and never disturbs the lower OTEL_UNWIND_ERROR
-	 * statement span.  The trace stays coherent.
+	 * underneath) otel_api unwinds the entries above ours, each exported
+	 * with ERROR status (plus a benign WARNING).  The out-of-order
+	 * sibling bridge span(s) are exported that way and the lower
+	 * statement span from otel_trace.c is undisturbed.  The trace stays
+	 * coherent.
 	 */
 	otel_span_end(s);
 }
@@ -794,8 +792,9 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
  * DONE probes never fire.  pg.query starts before the statement's
  * transaction, with no resource owner, so it is a session span that
  * otel_api would otherwise keep on its active stack, and every later span
- * in the backend would be parented under it.  These spans are
- * OTEL_UNWIND_DROP, so discarding them matches the unwind policy.
+ * in the backend would be parented under it.  They have no resource
+ * owner to unwind them on abort, so this bridge discards them itself,
+ * explicitly, rather than exporting them with ERROR status.
  */
 static void
 sdt_discard_open_spans(void)
