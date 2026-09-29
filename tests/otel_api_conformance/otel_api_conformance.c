@@ -2522,3 +2522,212 @@ otel_api_conformance_stress_ops(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
 }
+
+/* ----------------------------------------------------------------
+ * Spans started from abort-time code (t/015): an XACT_EVENT_ABORT
+ * callback, a SUBXACT_EVENT_ABORT_SUB callback, and a
+ * RegisterResourceReleaseCallback callback (the latter fires for every
+ * resource owner's every release phase, with CurrentResourceOwner set
+ * to the owner being released and that owner's ->releasing flag
+ * already true -- so a default-owner otel_span_start() from there
+ * always targets an owner that is mid-release; see otel_producer.h's
+ * ".owner" rule and ResourceOwnerEnlarge()'s "called after release
+ * started" check in resowner.c).  Each hook is armed for one shot and
+ * disarms itself so a single scenario doesn't repeat across every
+ * owner/phase in the backend.
+ * ---------------------------------------------------------------- */
+
+typedef enum ConformanceAbortSpanMode
+{
+	CONFORMANCE_ABORT_START_END = 0,	/* start, then end immediately */
+	CONFORMANCE_ABORT_LEAVE_OPEN,		/* start, deliberately don't end */
+	CONFORMANCE_ABORT_SESSION,			/* start a session-owned span, then end it */
+} ConformanceAbortSpanMode;
+
+static bool conformance_xact_abort_armed = false;
+static bool conformance_subxact_abort_armed = false;
+static bool conformance_release_cb_armed = false;
+static bool conformance_xact_cb_registered = false;
+static bool conformance_subxact_cb_registered = false;
+static bool conformance_release_cb_registered = false;
+static int	conformance_abort_span_mode = CONFORMANCE_ABORT_START_END;
+
+static bool conformance_abort_hook_ran = false;
+static int64 conformance_abort_span_started = 0;
+static int64 conformance_abort_span_ended = 0;
+static int64 conformance_abort_span_error_caught = 0;
+
+/*
+ * Common action run from all three trigger points.  Wrapped in its own
+ * PG_TRY: the point of this test is to observe whether otel_api's own
+ * ResourceOwnerEnlarge() call raises ERROR when the target owner is
+ * already releasing, not to find out what an *uncontained* ERROR does
+ * to a caller with no PG_CATCH of its own deep inside abort processing
+ * -- that is exactly the kind of thing a real extension's abort-time
+ * callback is expected to guard against, and every counter below is
+ * still meaningful whether or not the ERROR happens.
+ */
+static void
+conformance_abort_action(const char *label)
+{
+	conformance_abort_hook_ran = true;
+	PG_TRY();
+	{
+		OtelSpanRef s;
+
+		if (conformance_abort_span_mode == CONFORMANCE_ABORT_SESSION)
+			s = otel_span_start(.tracer = &tracer_a, .name = label,
+								 .owner = OTEL_OWNER_SESSION, .detached = true);
+		else
+			s = otel_span_start(.tracer = &tracer_a, .name = label);
+
+		if (s.v != 0)
+			conformance_abort_span_started++;
+		otel_span_set_int(s, "conformance.abort_mode", conformance_abort_span_mode);
+
+		if (conformance_abort_span_mode != CONFORMANCE_ABORT_LEAVE_OPEN)
+		{
+			otel_span_end(s);
+			conformance_abort_span_ended++;
+		}
+		/*
+		 * CONFORMANCE_ABORT_LEAVE_OPEN: s is deliberately abandoned here.
+		 * It must be cleaned up safely by whatever owns it (the abort
+		 * unwind machinery, or backend exit for a session span), not by
+		 * this callback.
+		 */
+	}
+	PG_CATCH();
+	{
+		conformance_abort_span_error_caught++;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
+static void
+conformance_xact_abort_callback(XactEvent event, void *arg)
+{
+	if (!conformance_xact_abort_armed)
+		return;
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		conformance_xact_abort_armed = false;
+		conformance_abort_action("conformance.abort.xact_event");
+	}
+}
+
+static void
+conformance_subxact_abort_callback(SubXactEvent event, SubTransactionId mySubid,
+									SubTransactionId parentSubid, void *arg)
+{
+	if (!conformance_subxact_abort_armed)
+		return;
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		conformance_subxact_abort_armed = false;
+		conformance_abort_action("conformance.abort.subxact_event");
+	}
+}
+
+/*
+ * Fires for every resource owner's every release phase in the backend
+ * (RegisterResourceReleaseCallback is global, not owner-scoped).  Armed
+ * for one shot; only acts on the first BEFORE_LOCKS/abort release it
+ * sees, which is CurrentResourceOwner's own release (owner->releasing
+ * is already true at that point).
+ */
+static void
+conformance_release_callback(ResourceReleasePhase phase, bool isCommit,
+							  bool isTopLevel, void *arg)
+{
+	if (!conformance_release_cb_armed)
+		return;
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS || isCommit)
+		return;
+	conformance_release_cb_armed = false;
+	conformance_abort_action("conformance.abort.release_callback");
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_arm_abort_hook);
+Datum
+otel_api_conformance_arm_abort_hook(PG_FUNCTION_ARGS)
+{
+	char	   *which = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *mode_s = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	if (strcmp(mode_s, "start_end") == 0)
+		conformance_abort_span_mode = CONFORMANCE_ABORT_START_END;
+	else if (strcmp(mode_s, "leave_open") == 0)
+		conformance_abort_span_mode = CONFORMANCE_ABORT_LEAVE_OPEN;
+	else if (strcmp(mode_s, "session") == 0)
+		conformance_abort_span_mode = CONFORMANCE_ABORT_SESSION;
+	else
+		ereport(ERROR, (errmsg("otel_api_conformance: unknown abort span mode \"%s\"", mode_s)));
+
+	if (strcmp(which, "xact") == 0)
+	{
+		if (!conformance_xact_cb_registered)
+		{
+			RegisterXactCallback(conformance_xact_abort_callback, NULL);
+			conformance_xact_cb_registered = true;
+		}
+		conformance_xact_abort_armed = true;
+	}
+	else if (strcmp(which, "subxact") == 0)
+	{
+		if (!conformance_subxact_cb_registered)
+		{
+			RegisterSubXactCallback(conformance_subxact_abort_callback, NULL);
+			conformance_subxact_cb_registered = true;
+		}
+		conformance_subxact_abort_armed = true;
+	}
+	else if (strcmp(which, "release") == 0)
+	{
+		if (!conformance_release_cb_registered)
+		{
+			RegisterResourceReleaseCallback(conformance_release_callback, NULL);
+			conformance_release_cb_registered = true;
+		}
+		conformance_release_cb_armed = true;
+	}
+	else
+		ereport(ERROR, (errmsg("otel_api_conformance: unknown abort hook \"%s\"", which)));
+
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_abort_hook_status);
+Datum
+otel_api_conformance_abort_hook_status(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf,
+					  "{\"ran\":%s,\"started\":" INT64_FORMAT
+					  ",\"ended\":" INT64_FORMAT
+					  ",\"error_caught\":" INT64_FORMAT
+					  ",\"span_current\":" INT64_FORMAT "}",
+					  conformance_abort_hook_ran ? "true" : "false",
+					  conformance_abort_span_started,
+					  conformance_abort_span_ended,
+					  conformance_abort_span_error_caught,
+					  otel_span_current().v);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_abort_hook_reset);
+Datum
+otel_api_conformance_abort_hook_reset(PG_FUNCTION_ARGS)
+{
+	conformance_abort_hook_ran = false;
+	conformance_abort_span_started = 0;
+	conformance_abort_span_ended = 0;
+	conformance_abort_span_error_caught = 0;
+	conformance_xact_abort_armed = false;
+	conformance_subxact_abort_armed = false;
+	conformance_release_cb_armed = false;
+	PG_RETURN_VOID();
+}

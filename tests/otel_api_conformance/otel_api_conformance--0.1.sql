@@ -331,3 +331,22 @@ CREATE FUNCTION otel_api_conformance_stress_ops(seed bigint, n_ops integer, mode
 RETURNS jsonb
 AS 'MODULE_PATHNAME', 'otel_api_conformance_stress_ops'
 LANGUAGE C VOLATILE STRICT;
+
+-- ----------------------------------------------------------------
+-- Spans started from abort-time code (t/015).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION otel_api_conformance_arm_abort_hook(which text, mode text DEFAULT 'start_end')
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_arm_abort_hook'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_abort_hook_status()
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'otel_api_conformance_abort_hook_status'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_abort_hook_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_abort_hook_reset'
+LANGUAGE C VOLATILE STRICT;
