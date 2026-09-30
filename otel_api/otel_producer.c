@@ -311,12 +311,14 @@ nrec_for_ref(OtelSpanRef s)
  *   event-attrs      an event's attribute-array copy (otel_span_add_event)
  *   vprintf          the oversized buffer in otel_span_set_vprintf
  *
- * Three more sites precede a call that can raise ERROR on a real OOM,
- * armed the same way but with the callback itself doing the ereport
- * (see tests/otel_api_conformance's injection callback):
+ * Four more sites precede a call that can raise ERROR for a reason other
+ * than a real OOM, armed the same way but with the callback itself doing
+ * the ereport (see tests/otel_api_conformance's injection callback):
  *   resowner-enlarge  ResourceOwnerEnlarge() in otel_span_start()
  *   slot-context      a slot's first AllocSetContextCreate() (take_slot)
  *   tracer-register   otel_tracer_register() in otel_span_start()
+ *   owner-forget      ResourceOwnerForget() in end_slot(): models its
+ *                     "after release started" ERROR, not an OOM
  *
  * No site sits on a path reachable from a critical section: otel_api's
  * own use of otel_span_context_of_internal() (from a commit-time trace-
@@ -933,6 +935,13 @@ dispatch_span(const OtelSpan *span)
  * has taken it off the active stack.  unwinding means the span didn't
  * reach otel_span_end(): it is exported with ERROR status, since
  * storage is owned by otel_api and exporting is always memory-safe.
+ *
+ * Forget the resource-owner entry before dispatching.
+ * ResourceOwnerForget() raises ERROR if the owner has started releasing;
+ * the span is then still unexported and still owned, and the owner's
+ * release exports it once.  From the forget to the slot reset in
+ * release_slot(), nothing may raise ERROR: dispatch_span() catches
+ * errors, and lower_error_event() allocates with MCXT_ALLOC_NO_OOM.
  */
 static void
 end_slot(int idx, TimestampTz end_time, bool unwinding, const char *unwind_reason)
@@ -940,6 +949,16 @@ end_slot(int idx, TimestampTz end_time, bool unwinding, const char *unwind_reaso
 	OtelSlot   *slot = &slots[idx];
 
 	Assert(!slot->dispatching);
+
+	if (slot->owner != NULL)
+	{
+		/* Test-only: see the injection-point doc comment above. */
+		INJECTION_POINT("otel-api-oom-owner-forget", NULL);
+		ResourceOwnerForget(slot->owner, Int64GetDatum(make_ref(slot->gen, idx, true).v),
+							&otel_span_resowner_desc);
+		slot->owner = NULL;
+	}
+
 	if (unwinding)
 	{
 		slot->span.status = OTEL_STATUS_ERROR;

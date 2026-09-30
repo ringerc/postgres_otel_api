@@ -2676,6 +2676,7 @@ typedef enum ConformanceAbortSpanMode
 	CONFORMANCE_ABORT_START_END = 0,	/* start, then end immediately */
 	CONFORMANCE_ABORT_LEAVE_OPEN,		/* start, deliberately don't end */
 	CONFORMANCE_ABORT_SESSION,			/* start a session-owned span, then end it */
+	CONFORMANCE_ABORT_END_TARGET,		/* end a pre-existing span, don't start one */
 } ConformanceAbortSpanMode;
 
 static bool conformance_xact_abort_armed = false;
@@ -2692,11 +2693,20 @@ static int64 conformance_abort_span_ended = 0;
 static int64 conformance_abort_span_error_caught = 0;
 
 /*
+ * CONFORMANCE_ABORT_END_TARGET's victim: a span the test started earlier
+ * (typically still owned by the resource owner that is about to release
+ * it), set via otel_api_conformance_set_abort_target_ref() before arming
+ * the hook (postgres-cdq.9.3 item 3: end_slot()/release_slot() ordering,
+ * reached from a resource-release callback rather than an emit hook).
+ */
+static int64 conformance_abort_target_ref = 0;
+
+/*
  * Common action run from all three trigger points.  The PG_TRY catches an
- * ERROR from otel_span_start() so that the counters report it.  errfinish()
- * zeroes InterruptHoldoffCount, and abort processing runs with interrupts
- * held, so a handler at this depth has to restore the count and the memory
- * context itself (see the comment in errfinish()).
+ * ERROR from otel_span_start()/otel_span_end() so that the counters report
+ * it.  errfinish() zeroes InterruptHoldoffCount, and abort processing runs
+ * with interrupts held, so a handler at this depth has to restore the count
+ * and the memory context itself (see the comment in errfinish()).
  */
 static void
 conformance_abort_action(const char *label)
@@ -2708,6 +2718,14 @@ conformance_abort_action(const char *label)
 	PG_TRY();
 	{
 		OtelSpanRef s;
+
+		if (conformance_abort_span_mode == CONFORMANCE_ABORT_END_TARGET)
+		{
+			s.v = conformance_abort_target_ref;
+			otel_span_end(s);
+			conformance_abort_span_ended++;
+			goto done;
+		}
 
 		if (conformance_abort_span_mode == CONFORMANCE_ABORT_SESSION)
 			s = otel_span_start(.tracer = &tracer_a, .name = label,
@@ -2730,6 +2748,7 @@ conformance_abort_action(const char *label)
 		 * unwind machinery, or backend exit for a session span), not by
 		 * this callback.
 		 */
+done: ;
 	}
 	PG_CATCH();
 	{
@@ -2798,6 +2817,8 @@ otel_api_conformance_arm_abort_hook(PG_FUNCTION_ARGS)
 		conformance_abort_span_mode = CONFORMANCE_ABORT_LEAVE_OPEN;
 	else if (strcmp(mode_s, "session") == 0)
 		conformance_abort_span_mode = CONFORMANCE_ABORT_SESSION;
+	else if (strcmp(mode_s, "end_target") == 0)
+		conformance_abort_span_mode = CONFORMANCE_ABORT_END_TARGET;
 	else
 		ereport(ERROR, (errmsg("otel_api_conformance: unknown abort span mode \"%s\"", mode_s)));
 
@@ -2865,6 +2886,16 @@ otel_api_conformance_abort_hook_reset(PG_FUNCTION_ARGS)
 	conformance_xact_abort_armed = false;
 	conformance_subxact_abort_armed = false;
 	conformance_release_cb_armed = false;
+	conformance_abort_target_ref = 0;
+	PG_RETURN_VOID();
+}
+
+/* The victim ref for arm_abort_hook(*, 'end_target'); see its declaration above. */
+PG_FUNCTION_INFO_V1(otel_api_conformance_set_abort_target_ref);
+Datum
+otel_api_conformance_set_abort_target_ref(PG_FUNCTION_ARGS)
+{
+	conformance_abort_target_ref = PG_GETARG_INT64(0);
 	PG_RETURN_VOID();
 }
 

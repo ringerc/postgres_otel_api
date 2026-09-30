@@ -361,6 +361,15 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_abort_hook_reset'
 LANGUAGE C VOLATILE STRICT;
 
+-- The victim ref for arm_abort_hook(*, 'end_target'): ends a pre-existing
+-- span (started by the test beforehand) instead of starting a new one.
+-- otel_api P2 edge-case plan, item 3 (postgres-cdq.9.3): end_slot()/
+-- release_slot() ordering, reached from a resource-release callback.
+CREATE FUNCTION otel_api_conformance_set_abort_target_ref(ref bigint)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_set_abort_target_ref'
+LANGUAGE C VOLATILE STRICT;
+
 -- ----------------------------------------------------------------
 -- Exporter misbehaviour during dispatch (t/017).
 -- ----------------------------------------------------------------
