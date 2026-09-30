@@ -57,6 +57,9 @@ typedef struct OtelApiCounters
 	uint64		unwound;			/* ended by owner release or by an enclosing
 									 * span ending first, exported as ERROR */
 	uint64		leaked_at_commit;
+	uint64		dropped_in_dispatch;	/* released again by its owner after a
+										 * FATAL during its dispatch; not
+										 * exported again */
 	uint64		open_at_exit;		/* session spans open at backend exit */
 
 	uint64		attr_truncated;

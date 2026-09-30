@@ -426,14 +426,13 @@ sub run_fatal_scenario
 	# The backend-local capture list is gone once the backend exits, and
 	# dispatch_span() calls the emit hook *before* it checks
 	# otel_api.emit_spans_to_log, so a hook that goes FATAL is never
-	# reached by otel_producer.c's own "otel-span: ..." log line on any
-	# attempt.  conformance_do_misbehave()'s FATAL case logs its own
-	# "misbehaviour fatal dispatch #N" line first (see
-	# otel_api_conformance.c), so we count dispatch attempts for this
-	# span directly: if AbortOutOfAnyTransaction() reaches the same
-	# still-owner-remembered span a second time (slot->dispatching never
-	# got reset to false, because the FATAL never returned from
-	# dispatch_span()), a second numbered line appears.
+	# reached by otel_producer.c's own "otel-span: ..." log line.
+	# conformance_do_misbehave()'s FATAL case logs its own "misbehaviour
+	# fatal dispatch #N" line first (see otel_api_conformance.c), so we
+	# count dispatch attempts for this span directly.  On the abort path
+	# the FATAL leaves the span in its resource owner, and backend exit
+	# releases that owner again; the span must not be dispatched a second
+	# time.
 	my $log_start = -s $node->logfile;
 	my ($ret, $stdout, $stderr) = $node->psql('postgres', $sql, on_error_stop => 0);
 	isnt($ret, 0, "$label: the connection is closed");
@@ -442,51 +441,21 @@ sub run_fatal_scenario
 	unlike($log, qr/PANIC/, "$label: no PANIC in the server log");
 
 	my $dispatch_count = () = $log =~ /misbehaviour fatal dispatch #\d+ for "\Q$span_name\E"/g;
-	note("$label: \"$span_name\" was dispatched (logged) $dispatch_count time(s)");
-	if ($dispatch_count > 1)
-	{
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: the FATAL span is dispatched a second time during "
-			  . "backend exit (evidence: $dispatch_count log lines for \"$span_name\") -- "
-			  . "slot->dispatching is still true when ereport(FATAL) is called from inside "
-			  . "dispatch_span(), so the span is never marked done and "
-			  . "its resource owner still remembers it; AbortOutOfAnyTransaction()'s "
-			  . "ResourceOwnerReleaseAll() releases it again, reaching end_slot() a second time.";
-			is($dispatch_count, 1, "$label: the span is dispatched exactly once");
-		}
-	}
-	else
-	{
-		is($dispatch_count, 1, "$label: the span is dispatched exactly once")
-		  or diag("server log:\n$log");
-	}
+	is($dispatch_count, 1, "$label: the span is dispatched exactly once");
 
-	if ($log =~ /terminated by signal|TRAP:/)
+	my $crashed = $log =~ /terminated by signal|TRAP:/;
+	ok(!$crashed, "$label: the FATAL does not escalate into a crash-restart")
+	  or diag("server log:\n$log");
+
+	my $survived = eval { $survivor->query_safe("SELECT 2") };
+	is($survived, '2', "$label: a second, persistent session stays usable");
+
+	if ($crashed)
 	{
-		diag("server log:\n$log");
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: ereport(FATAL) from the emit hook is called with "
-			  . "slot->dispatching still true (dispatch_span); proc_exit "
-			  . "unwinds via AbortOutOfAnyTransaction -> ResourceOwnerReleaseAll, which reaches "
-			  . "otel_span_release_resource()/end_slot() for that same span and Asserts "
-			  . "!slot->dispatching on cassert builds, escalating the clean "
-			  . "FATAL into an Assert crash and a full crash-restart (evidence in the diag above).";
-			fail("$label: FATAL should not escalate into a crash-restart");
-		}
-		ok(wait_for_restart(), "$label: server accepts connections again")
+		# Let the remaining scenarios run against a restarted server.
+		wait_for_restart()
 		  or BAIL_OUT("server did not come back up after the induced crash");
-		# The crash-restart kills every backend, including the survivor;
-		# reconnect fresh to show the postmaster itself is usable again.
-		$survivor = $node->background_psql('postgres');
-		is($survivor->query_safe("SELECT 2"), '2',
-			"$label: a fresh session is usable once the postmaster restarts");
-	}
-	else
-	{
-		is($survivor->query_safe("SELECT 2"), '2',
-			"$label: a second, persistent session stays usable -- no crash-restart occurred");
+		return;
 	}
 	$survivor->quit;
 }

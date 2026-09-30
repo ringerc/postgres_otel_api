@@ -994,7 +994,15 @@ otel_span_debug_print(Datum res)
 	return pstrdup("otel_api span (stale)");
 }
 
-/* ResourceOwnerDesc.ReleaseResource: the owner is being released. */
+/*
+ * ResourceOwnerDesc.ReleaseResource: the owner is being released.
+ *
+ * ResourceOwnerReleaseAll() drops an entry only after this returns.  If
+ * an emit hook raises FATAL while the span is dispatched from here, the
+ * entry stays, and backend exit (AbortOutOfAnyTransaction) releases the
+ * owner again.  The span is then still dispatching: free it without
+ * exporting it a second time.
+ */
 static void
 otel_span_release_resource(Datum res)
 {
@@ -1012,9 +1020,12 @@ otel_span_release_resource(Datum res)
 	if (pos >= 0)
 		stack_remove_at(pos);
 
-	if (slot->leaked)
+	if (slot->leaked || slot->dispatching)
 	{
-		otel_counters.leaked_at_commit++;
+		if (slot->leaked)
+			otel_counters.leaked_at_commit++;
+		else
+			otel_counters.dropped_in_dispatch++;
 		release_slot(idx, true);
 		return;
 	}
@@ -1948,7 +1959,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
 		F(in_crit_section), F(in_emit_hook), F(start_bad_args),
 		F(stale_handle), F(non_lifo_end), F(unwound),
-		F(leaked_at_commit), F(open_at_exit),
+		F(leaked_at_commit), F(dropped_in_dispatch), F(open_at_exit),
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),
 		F(error_capture_failed), F(emit_hook_errors),
 #undef F

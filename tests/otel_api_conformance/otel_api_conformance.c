@@ -807,6 +807,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"non_lifo_end\":" UINT64_FORMAT ","
 					  "\"unwound\":" UINT64_FORMAT ","
 					  "\"leaked_at_commit\":" UINT64_FORMAT ","
+					  "\"dropped_in_dispatch\":" UINT64_FORMAT ","
 					  "\"open_at_exit\":" UINT64_FORMAT ","
 					  "\"attr_truncated\":" UINT64_FORMAT ","
 					  "\"attr_dropped\":" UINT64_FORMAT ","
@@ -822,7 +823,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  c.start_no_slot, c.start_no_session_slot, c.start_stack_full,
 					  c.in_crit_section, c.in_emit_hook, c.start_bad_args,
 					  c.stale_handle, c.non_lifo_end, c.unwound,
-					  c.leaked_at_commit, c.open_at_exit,
+					  c.leaked_at_commit, c.dropped_in_dispatch, c.open_at_exit,
 					  c.attr_truncated, c.attr_dropped, c.event_dropped, c.link_dropped,
 					  c.error_capture_failed, c.emit_hook_errors,
 					  conformance_sampler_calls, conformance_side_effect_calls,
