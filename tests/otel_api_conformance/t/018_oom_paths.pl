@@ -511,9 +511,10 @@ for my $field (qw(filename funcname))
 }
 
 # ---- pool: a failed slots allocation must not leave its context behind ----
-# ensure_pool creates span_pool_cxt before allocating the slots array, and
-# creates a new one on every retry.  Two failed first spans and one good one
-# must still leave exactly one "otel_api span pool" context.
+# ensure_pool only creates span_pool_cxt if it doesn't already exist, so a
+# failed slots allocation doesn't leak a new context on retry.  Two failed
+# first spans and one good one must still leave exactly one "otel_api span
+# pool" context.
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
 SELECT otel_api_conformance_oom_arm('pool', 0, 2);
@@ -528,12 +529,7 @@ SQL
 	my @l = split /\n/, $out;
 	my ($failed, $pools) = @l[-2, -1];
 	is($failed, 2, 'pool retry: both first attempts failed at the injection point');
-	TODO:
-	{
-		local $TODO = 'postgres-cdq.9.2: ensure_pool leaks span_pool_cxt when the slots '
-		  . 'allocation fails, and creates another on each retry';
-		is($pools, 1, "pool retry: one span pool context (got $pools)");
-	}
+	is($pools, 1, "pool retry: one span pool context (got $pools)");
 }
 
 $node->stop;

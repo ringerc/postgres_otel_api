@@ -624,8 +624,9 @@ ensure_pool(void)
 {
 	if (likely(slots != NULL))
 		return true;
-	span_pool_cxt = AllocSetContextCreate(TopMemoryContext, "otel_api span pool",
-										  ALLOCSET_SMALL_SIZES);
+	if (span_pool_cxt == NULL)
+		span_pool_cxt = AllocSetContextCreate(TopMemoryContext, "otel_api span pool",
+											  ALLOCSET_SMALL_SIZES);
 	nslots = otel_max_open_spans;
 	if (otel_inject_fail("otel-api-oom-pool"))
 		return false;
