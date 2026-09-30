@@ -887,10 +887,16 @@ static void
 dispatch_span(const OtelSpan *span)
 {
 	otel_span_emit_hook_type emit_hook = otel_get_span_emit_hook();
+	uint32		save_holdoff;
+	uint32		save_query_cancel_holdoff;
+	MemoryContext save_cxt;
 
 	if (emit_hook == NULL && !otel_emit_spans_to_log)
 		return;
 
+	save_holdoff = InterruptHoldoffCount;
+	save_query_cancel_holdoff = QueryCancelHoldoffCount;
+	save_cxt = CurrentMemoryContext;
 	PG_TRY();
 	{
 		if (emit_hook)
@@ -900,7 +906,16 @@ dispatch_span(const OtelSpan *span)
 	}
 	PG_CATCH();
 	{
-		/* A tracing failure must not break the traced operation. */
+		/*
+		 * A tracing failure must not break the traced operation.
+		 * errfinish() zeroes InterruptHoldoffCount and
+		 * QueryCancelHoldoffCount before throwing, and error handling
+		 * leaves CurrentMemoryContext as ErrorContext; restore all three
+		 * (see the comment in errfinish()).
+		 */
+		MemoryContextSwitchTo(save_cxt);
+		InterruptHoldoffCount = save_holdoff;
+		QueryCancelHoldoffCount = save_query_cancel_holdoff;
 		FlushErrorState();
 		otel_counters.emit_hook_errors++;
 	}

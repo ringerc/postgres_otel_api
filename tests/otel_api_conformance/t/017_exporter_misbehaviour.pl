@@ -282,44 +282,12 @@ for my $held (0, 1)
 	note("$label: $out");
 	is($probe->{misbehave_count}, 1, "$label: the induced error ran exactly once");
 
-	if ($probe->{before_context} ne $probe->{after_context})
-	{
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: dispatch_span()'s PG_CATCH "
-			  . "leaves CurrentMemoryContext as ErrorContext after swallowing the "
-			  . "emit hook's ERROR, instead of restoring the context the producer was in before "
-			  . "calling otel_span_end() (evidence: before=\"$probe->{before_context}\" "
-			  . "after=\"$probe->{after_context}\").";
-			is($probe->{after_context}, $probe->{before_context},
-				"$label: CurrentMemoryContext is restored after otel_span_end() returns");
-		}
-	}
-	else
-	{
-		is($probe->{after_context}, $probe->{before_context},
-			"$label: CurrentMemoryContext is restored after otel_span_end() returns");
-	}
+	is($probe->{after_context}, $probe->{before_context},
+		"$label: CurrentMemoryContext is restored after otel_span_end() returns");
 
 	my $expected_holdoff = $held ? $probe->{before_holdoff} + 1 : $probe->{before_holdoff};
-	if ($probe->{after_holdoff} != $expected_holdoff)
-	{
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: dispatch_span()'s PG_CATCH doesn't restore "
-			  . "InterruptHoldoffCount either; errfinish() zeroes it for the induced ERROR, "
-			  . "clobbering any holdoff the producer itself was already holding (evidence: "
-			  . "before=$probe->{before_holdoff} after=$probe->{after_holdoff} "
-			  . "expected=$expected_holdoff, held=$held).";
-			is($probe->{after_holdoff}, $expected_holdoff,
-				"$label: InterruptHoldoffCount is unchanged (or +1 if held) after otel_span_end() returns");
-		}
-	}
-	else
-	{
-		is($probe->{after_holdoff}, $expected_holdoff,
-			"$label: InterruptHoldoffCount is unchanged (or +1 if held) after otel_span_end() returns");
-	}
+	is($probe->{after_holdoff}, $expected_holdoff,
+		"$label: InterruptHoldoffCount is unchanged (or +1 if held) after otel_span_end() returns");
 }
 
 # ----------------------------------------------------------------
@@ -447,39 +415,14 @@ for my $mode (qw(error start_end end_other))
 		  . ($holdoff ? encode_json($holdoff) : '<none>')
 		  . "; pg_sleep/statement_timeout stderr = " . ($stderr // ''));
 
-	if ($holdoff && ($holdoff->{interrupt_holdoff} != 0 || $holdoff->{query_cancel_holdoff} != 0))
-	{
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: after the abort, InterruptHoldoffCount/"
-			  . "QueryCancelHoldoffCount are nonzero in this backend (evidence: "
-			  . encode_json($holdoff) . "); RESUME_INTERRUPTS() in AbortTransaction() (xact.c) "
-			  . "decremented from whatever dispatch_span()'s uncaught-holdoff state left behind, "
-			  . "instead of the 0 a clean abort should leave.";
-			is($holdoff->{interrupt_holdoff}, 0, "B/$mode: InterruptHoldoffCount is 0 after the abort");
-		}
-	}
-	elsif ($holdoff)
+	if ($holdoff)
 	{
 		is($holdoff->{interrupt_holdoff}, 0, "B/$mode: InterruptHoldoffCount is 0 after the abort");
+		is($holdoff->{query_cancel_holdoff}, 0, "B/$mode: QueryCancelHoldoffCount is 0 after the abort");
 	}
 
-	if (defined $stderr && $stderr =~ /canceling statement due to statement timeout/)
-	{
-		pass("B/$mode: statement_timeout still cancels a long statement in this backend");
-	}
-	else
-	{
-		TODO:
-		{
-			local $TODO = "postgres-cdq.9.3: a 200ms statement_timeout failed to cancel "
-			  . "pg_sleep(5) in this backend after the abort-time misbehaviour -- consistent "
-			  . "with InterruptHoldoffCount having wrapped to a large value and "
-			  . "INTERRUPTS_CAN_BE_PROCESSED() never being true again (evidence: stderr="
-			  . (defined $stderr ? $stderr : '<undef>') . ").";
-			fail("B/$mode: statement_timeout should still cancel a long statement in this backend");
-		}
-	}
+	like($stderr, qr/canceling statement due to statement timeout/,
+		"B/$mode: statement_timeout still cancels a long statement in this backend");
 
 	SKIP:
 	{
