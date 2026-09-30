@@ -140,6 +140,7 @@ static int	nslots = 0;			/* otel_max_open_spans, fixed at first use */
 static int	slots_used = 0;		/* slots below this have been initialised */
 static int	slot_free_head = -1;
 static int	session_spans_open = 0;
+static int	dispatch_depth = 0;	/* > 0 while an emit hook runs */
 static MemoryContext span_pool_cxt = NULL;
 
 static OtelNrec nrecs[OTEL_MAX_STACK_DEPTH];
@@ -890,6 +891,7 @@ dispatch_span(const OtelSpan *span)
 	uint32		save_holdoff;
 	uint32		save_query_cancel_holdoff;
 	MemoryContext save_cxt;
+	int			save_depth = dispatch_depth;
 
 	if (emit_hook == NULL && !otel_emit_spans_to_log)
 		return;
@@ -899,10 +901,12 @@ dispatch_span(const OtelSpan *span)
 	save_cxt = CurrentMemoryContext;
 	PG_TRY();
 	{
+		dispatch_depth++;
 		if (emit_hook)
 			emit_hook(span);
 		if (otel_emit_spans_to_log)
 			otel_emit_span_as_log_line(span);
+		dispatch_depth--;
 	}
 	PG_CATCH();
 	{
@@ -914,6 +918,7 @@ dispatch_span(const OtelSpan *span)
 		 * (see the comment in errfinish()).
 		 */
 		MemoryContextSwitchTo(save_cxt);
+		dispatch_depth = save_depth;
 		InterruptHoldoffCount = save_holdoff;
 		QueryCancelHoldoffCount = save_query_cancel_holdoff;
 		FlushErrorState();
@@ -1116,17 +1121,29 @@ start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
 static void nrec_context(OtelNrec *n, OtelSpanContext *out);
 
 /*
- * No producer call may run inside a critical section.  cassert builds fail
- * the Assert; other builds count the call and do nothing.
+ * No producer call may run inside a critical section, or from inside an
+ * emit hook.  cassert builds fail an Assert; other builds count the call
+ * and do nothing.  A read_only call allocates nothing and changes no
+ * span, so an emit hook may make it.  After a FATAL from an emit hook,
+ * backend exit runs with dispatch_depth still raised; calls made then are
+ * refused without the Assert.
  */
 static inline bool
-in_crit_section(void)
+call_refused(bool read_only)
 {
 	Assert(CritSectionCount == 0);
-	if (likely(CritSectionCount == 0))
-		return false;
-	otel_counters.in_crit_section++;
-	return true;
+	Assert(read_only || dispatch_depth == 0 || proc_exit_inprogress);
+	if (unlikely(CritSectionCount != 0))
+	{
+		otel_counters.in_crit_section++;
+		return true;
+	}
+	if (unlikely(dispatch_depth > 0) && !read_only)
+	{
+		otel_counters.in_emit_hook++;
+		return true;
+	}
+	return false;
 }
 
 static OtelSpanRef
@@ -1142,7 +1159,7 @@ api_span_start(const OtelSpanStartArgs *args)
 	OtelSlot   *slot;
 	OtelSpanRef ref;
 
-	if (in_crit_section())
+	if (call_refused(false))
 		return OTEL_SPAN_NONE;
 	if (args == NULL || args->struct_size < sizeof(OtelSpanStartArgs) ||
 		args->name == NULL)
@@ -1320,7 +1337,7 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 {
 	int			pos;
 
-	if (in_crit_section() || s.v == 0)
+	if (call_refused(false) || s.v == 0)
 		return;
 	check_scoped_frames();
 
@@ -1351,12 +1368,6 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 
 		if (slot == NULL)
 			return;
-		if (slot->dispatching)
-		{
-			otel_counters.stale_handle++;
-			Assert(false);		/* ended from its own emit hook */
-			return;
-		}
 		idx = slot - slots;
 		if (!slot->detached && (pos = stack_find(stack_entry_for_slot(idx))) >= 0)
 		{
@@ -1401,14 +1412,9 @@ slot_attr(OtelSlot *slot, const char *key)
 static OtelSlot *
 setter_slot(OtelSpanRef s)
 {
-	OtelSlot   *slot;
-
-	if (in_crit_section() || s.v <= 0)
+	if (call_refused(false) || s.v <= 0)
 		return NULL;
-	slot = slot_for_ref(s);
-	if (slot != NULL && slot->dispatching)
-		return NULL;
-	return slot;
+	return slot_for_ref(s);
 }
 
 static void
@@ -1657,7 +1663,7 @@ api_span_current(void)
 {
 	int32		e;
 
-	if (in_crit_section() || span_stack_depth == 0)
+	if (call_refused(true) || span_stack_depth == 0)
 		return OTEL_SPAN_NONE;
 	e = span_stack[span_stack_depth - 1];
 	if (e >= 0)
@@ -1732,7 +1738,7 @@ otel_span_context_of_internal(OtelSpanRef s, OtelSpanContext *out)
 static bool
 api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
 {
-	if (in_crit_section())
+	if (call_refused(true))
 	{
 		memset(out, 0, sizeof(*out));
 		return false;
@@ -1743,7 +1749,7 @@ api_span_context_of(OtelSpanRef s, OtelSpanContext *out)
 static void
 api_resource_add(const char *key, const char *value)
 {
-	if (in_crit_section())
+	if (call_refused(false))
 		return;
 	otel_resource_attr_add(key, value);
 }
@@ -1753,7 +1759,7 @@ api_span_discard(OtelSpanRef s)
 {
 	int			pos;
 
-	if (in_crit_section() || s.v == 0)
+	if (call_refused(false) || s.v == 0)
 		return;
 	if (s.v < 0)
 	{
@@ -1769,7 +1775,7 @@ api_span_discard(OtelSpanRef s)
 	{
 		OtelSlot   *slot = slot_for_ref(s);
 
-		if (slot == NULL || slot->dispatching)
+		if (slot == NULL)
 			return;
 		if ((pos = stack_find(stack_entry_for_slot(slot - slots))) >= 0)
 			stack_remove_at(pos);
@@ -1921,7 +1927,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 #define F(f) {#f, offsetof(OtelApiCounters, f)}
 		F(spans_started), F(spans_unsampled), F(spans_emitted), F(spans_discarded),
 		F(start_no_slot), F(start_no_session_slot), F(start_stack_full),
-		F(in_crit_section), F(start_bad_args),
+		F(in_crit_section), F(in_emit_hook), F(start_bad_args),
 		F(stale_handle), F(non_lifo_end), F(unwound),
 		F(leaked_at_commit), F(open_at_exit),
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),

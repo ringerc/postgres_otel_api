@@ -14,6 +14,11 @@
  * exporter that allocates must expect it to fail.  An ERROR raised by
  * the hook is caught and discarded.
  *
+ * The hook must not call the producer API (otel_producer.h), except for
+ * otel_span_current() and otel_span_context_of().  Other calls are
+ * refused: cassert builds fail an Assert, and other builds count the
+ * call in otel_api_counters() as in_emit_hook and do nothing.
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * otel_api/otel_exporter.h

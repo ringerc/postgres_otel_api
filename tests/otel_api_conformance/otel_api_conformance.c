@@ -801,6 +801,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"start_no_session_slot\":" UINT64_FORMAT ","
 					  "\"start_stack_full\":" UINT64_FORMAT ","
 					  "\"in_crit_section\":" UINT64_FORMAT ","
+					  "\"in_emit_hook\":" UINT64_FORMAT ","
 					  "\"start_bad_args\":" UINT64_FORMAT ","
 					  "\"stale_handle\":" UINT64_FORMAT ","
 					  "\"non_lifo_end\":" UINT64_FORMAT ","
@@ -819,7 +820,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "}",
 					  c.spans_started, c.spans_unsampled, c.spans_emitted, c.spans_discarded,
 					  c.start_no_slot, c.start_no_session_slot, c.start_stack_full,
-					  c.in_crit_section, c.start_bad_args,
+					  c.in_crit_section, c.in_emit_hook, c.start_bad_args,
 					  c.stale_handle, c.non_lifo_end, c.unwound,
 					  c.leaked_at_commit, c.open_at_exit,
 					  c.attr_truncated, c.attr_dropped, c.event_dropped, c.link_dropped,
@@ -2906,6 +2907,7 @@ static int64 conformance_misbehave_target_ref = 0;
 static bool conformance_misbehave_start_end_guard = false;	/* start_end: one level deep */
 static int	conformance_misbehave_unguarded_depth = 0;		/* static recursion counter */
 static int64 conformance_misbehave_max_depth = 0;
+static int64 conformance_misbehave_calls = 0;	/* producer calls that reached otel_api */
 
 static void
 conformance_do_misbehave(const OtelSpan *span)
@@ -2959,6 +2961,8 @@ conformance_do_misbehave(const OtelSpan *span)
 				conformance_misbehave_max_depth = 1;	/* guarded: exactly one level */
 				s = otel_span_start(.tracer = &tracer_a, .name = "conformance.from_hook");
 				otel_span_end(s);
+				/* otel_span_end(OTEL_SPAN_NONE) doesn't reach otel_api. */
+				conformance_misbehave_calls += s.v != 0 ? 2 : 1;
 				conformance_misbehave_start_end_guard = false;
 			}
 			break;
@@ -2974,6 +2978,7 @@ conformance_do_misbehave(const OtelSpan *span)
 				{
 					s = otel_span_start(.tracer = &tracer_a, .name = "conformance.from_hook");
 					otel_span_end(s);
+					conformance_misbehave_calls += s.v != 0 ? 2 : 1;
 				}
 				conformance_misbehave_unguarded_depth--;
 			}
@@ -2985,6 +2990,7 @@ conformance_do_misbehave(const OtelSpan *span)
 				OtelSpanRef target = {.v = conformance_misbehave_target_ref};
 
 				otel_span_end(target);
+				conformance_misbehave_calls++;
 			}
 			break;
 	}
@@ -3038,8 +3044,10 @@ otel_api_conformance_misbehaviour_status(PG_FUNCTION_ARGS)
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf,
-					  "{\"count\":" INT64_FORMAT ",\"max_depth\":" INT64_FORMAT "}",
-					  conformance_misbehave_count, conformance_misbehave_max_depth);
+					  "{\"count\":" INT64_FORMAT ",\"max_depth\":" INT64_FORMAT
+					  ",\"calls\":" INT64_FORMAT "}",
+					  conformance_misbehave_count, conformance_misbehave_max_depth,
+					  conformance_misbehave_calls);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
 }
 
@@ -3055,6 +3063,7 @@ otel_api_conformance_misbehaviour_reset(PG_FUNCTION_ARGS)
 	conformance_misbehave_start_end_guard = false;
 	conformance_misbehave_unguarded_depth = 0;
 	conformance_misbehave_max_depth = 0;
+	conformance_misbehave_calls = 0;
 	PG_RETURN_VOID();
 }
 

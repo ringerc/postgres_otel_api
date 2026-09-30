@@ -28,6 +28,8 @@
  * Rules, all checked:
  *	 - Never call the API in a critical section.  cassert builds fail an
  *	   Assert; other builds get OTEL_SPAN_NONE or a no-op.
+ *	 - Never call the API from an emit hook (see otel_exporter.h), except
+ *	   otel_span_current() and otel_span_context_of().  Same checks.
  *	 - A handle is dead after otel_span_end().  Using it again is a no-op
  *	   that is counted, and fails an Assert in cassert builds.
  *	 - Spans on the active stack should end in LIFO order.  Ending a span
