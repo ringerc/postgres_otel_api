@@ -46,6 +46,7 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "tcop/cmdtag.h"
+#include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/backend_status.h"
 #include "utils/elog.h"
@@ -82,7 +83,7 @@
  * cleanup only, not span cleanup.
  *
  * detached marks a cursor's executor span (see
- * otel_declaring_cursor_portal below): it is .detached, so it does not
+ * otel_declaring_cursor_name below): it is .detached, so it does not
  * sit on otel_api's active stack across the statements between
  * DECLARE and CLOSE/portal-drop.  otel_ExecutorRun() looks entries up
  * by key (without removing them) to activate/deactivate it around the
@@ -101,12 +102,36 @@ static StmtSpanEntry stmt_stack[OTEL_STMT_STACK_MAX];
 static int	stmt_stack_depth = 0;
 
 /*
- * True for the duration of PerformCursorOpen()'s call down from
- * otel_ProcessUtility(), i.e. exactly while the cursor's own
- * ExecutorStart runs.  Tells otel_ExecutorStart() to start that one
- * span .detached (see push_stmt_span()/start_stmt_span()).
+ * The portal name from a DeclareCursorStmt currently being processed
+ * by otel_ProcessUtility(), or NULL.  PerformCursorOpen() plans the
+ * cursor's query (which can run arbitrary nested statements, e.g. a
+ * volatile-in-practice IMMUTABLE function folded by the planner, each
+ * with its own ExecutorStart) *before* it creates the portal and
+ * calls PortalStart() -- so a bare "are we inside DECLARE CURSOR's
+ * ProcessUtility call" flag would wrongly mark every such nested
+ * statement's span .detached too, not just the cursor's own.
+ *
+ * PortalStart() (tcop/pquery.c) sets the global ActivePortal to the
+ * new portal *before* calling ExecutorStart() for it, and nothing
+ * else does between here and there (planning happens first, with
+ * ActivePortal still pointing at whatever the enclosing statement's
+ * portal is). So otel_ExecutorStart() checks ActivePortal->name
+ * against this name: true only for the cursor's own ExecutorStart,
+ * never for a nested statement run during planning.
  */
-static bool otel_declaring_cursor_portal = false;
+static const char *otel_declaring_cursor_name = NULL;
+
+/* True iff ActivePortal is the cursor otel_declaring_cursor_name names --
+ * i.e. this ExecutorStart is the cursor's own, not some nested statement
+ * run while planning it. */
+static inline bool
+otel_active_portal_is_declaring_cursor(void)
+{
+	return otel_declaring_cursor_name != NULL &&
+		ActivePortal != NULL &&
+		ActivePortal->name != NULL &&
+		strcmp(ActivePortal->name, otel_declaring_cursor_name) == 0;
+}
 
 /* Per-backend scratch context for building attribute values (e.g. plan
  * shape digests) that are copied into the span the moment they're set;
@@ -450,7 +475,7 @@ static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	OtelSpanRef s;
-	bool		is_cursor = otel_declaring_cursor_portal;
+	bool		is_cursor = otel_active_portal_is_declaring_cursor();
 
 	if (queryDesc != NULL)
 		maybe_apply_sqlcommenter(queryDesc->sourceText);
@@ -462,8 +487,11 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * INTERCEPTED-tracepoint span-source discriminator is still owed;
 	 * OTEL_PG_SPAN_SOURCE is available for that once adopted here).
 	 *
-	 * A cursor's span (otel_declaring_cursor_portal set by
-	 * otel_ProcessUtility for DECLARE CURSOR) is .detached: it must
+	 * A cursor's span (ActivePortal matching otel_declaring_cursor_name,
+	 * set by otel_ProcessUtility for DECLARE CURSOR -- not just "are we
+	 * somewhere inside its ProcessUtility call", which would also wrongly
+	 * match a nested statement run while planning the cursor's query) is
+	 * .detached: it must
 	 * outlive this call, staying open across every FETCH up to CLOSE,
 	 * so it cannot sit on otel_api's active stack the way an ordinary
 	 * statement span does.  otel_ExecutorRun() activates it only for
@@ -594,9 +622,10 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	 * address of this frame-local variable. */
 	char		call_token;
 	OtelSpanRef s = OTEL_SPAN_NONE;
-	bool		is_declare_cursor = pstmt->utilityStmt &&
-		IsA(pstmt->utilityStmt, DeclareCursorStmt);
-	bool		save_declaring_cursor_portal = otel_declaring_cursor_portal;
+	DeclareCursorStmt *cstmt = (pstmt->utilityStmt &&
+								 IsA(pstmt->utilityStmt, DeclareCursorStmt))
+		? (DeclareCursorStmt *) pstmt->utilityStmt : NULL;
+	const char *save_declaring_cursor_name = otel_declaring_cursor_name;
 
 	if (context == PROCESS_UTILITY_TOPLEVEL)
 	{
@@ -613,16 +642,20 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 	/*
-	 * otel_ExecutorStart(), called synchronously from
-	 * PerformCursorOpen()'s PortalStart() below, checks this flag to
-	 * start the cursor's own executor span .detached.  Save/restore
-	 * rather than assume it was false: a DECLARE CURSOR whose query
-	 * itself somehow re-enters ProcessUtility (not expected, but this
-	 * keeps a stray error path from leaving the flag stuck on) must not
-	 * clobber an enclosing one.
+	 * otel_ExecutorStart(), called synchronously below (from
+	 * PerformCursorOpen()'s PortalStart() for a real DECLARE CURSOR,
+	 * but also, earlier in this same call, from planning the cursor's
+	 * query -- constant-folding an IMMUTABLE function that itself runs
+	 * SQL, say -- for any nested statement that runs along the way),
+	 * checks otel_active_portal_is_declaring_cursor() to start the
+	 * cursor's own executor span .detached. Save/restore rather than
+	 * assume it was NULL: a DECLARE CURSOR whose query itself somehow
+	 * re-enters ProcessUtility (not expected, but this keeps a stray
+	 * error path from leaving it stuck) must not clobber an enclosing
+	 * one.
 	 */
-	if (is_declare_cursor)
-		otel_declaring_cursor_portal = true;
+	if (cstmt != NULL)
+		otel_declaring_cursor_name = cstmt->portalname;
 
 	PG_TRY();
 	{
@@ -637,7 +670,7 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	}
 	PG_CATCH();
 	{
-		otel_declaring_cursor_portal = save_declaring_cursor_portal;
+		otel_declaring_cursor_name = save_declaring_cursor_name;
 		/* Re-throw; the span (if any) is ended, and exported with
 		 * ERROR status, by resource-owner release.  Just keep our
 		 * own bookkeeping consistent. */
@@ -646,7 +679,7 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	otel_declaring_cursor_portal = save_declaring_cursor_portal;
+	otel_declaring_cursor_name = save_declaring_cursor_name;
 
 	if (context == PROCESS_UTILITY_TOPLEVEL)
 	{

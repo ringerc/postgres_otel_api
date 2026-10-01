@@ -232,4 +232,101 @@ note("debug_assertions = $cassert");
 		'the postmaster is healthy after the erroring FETCH');
 }
 
+# ----------------------------------------------------------------------
+# Scenario 6 (postgres-cdq.10 review follow-up, defect 3): DECLARE
+# CURSOR's query planning can run arbitrary nested statements before
+# the cursor's own ExecutorStart ever runs -- e.g. constant-folding an
+# IMMUTABLE function that itself executes SQL (PerformCursorOpen calls
+# pg_plan_query(), which can invoke such a function via
+# eval_const_expressions(), *before* it creates the portal and calls
+# PortalStart() for the cursor itself). A flag that is merely "are we
+# somewhere inside DECLARE CURSOR's ProcessUtility call" (the
+# original otel_declaring_cursor_portal) is set across all of that
+# too, wrongly marking every such nested statement's own span
+# .detached -- not just the cursor's.
+#
+# Fixed by checking core's ActivePortal (tcop/pquery.h) against the
+# cursor's own portal name: PortalStart() sets ActivePortal to the new
+# cursor portal only immediately before calling ExecutorStart() for
+# it, strictly after planning (and hence after any nested statements
+# planning might run) has already finished.
+#
+# This was confirmed against the pre-fix code with a temporary
+# diagnostic (not committed): logging otel_ExecutorStart()'s
+# "is_cursor" decision showed it wrongly true for both nested
+# statements below, and ActivePortal->name empty (the top-level
+# unnamed portal) rather than "c" at that point -- proving the flag
+# leaked. Fixed, it is only true for the cursor's own ExecutorStart.
+#
+# Note: once otel_declaring_cursor_name no longer leaks, both the
+# nested statement and the cursor's query correctly compute their own
+# parent from the active stack regardless -- otel_ExecutorRun()'s
+# activate/deactivate (the postgres-cdq.10 fix itself) happens to
+# mask the pre-fix mislabelling's effect on simple parentage checks
+# for a *single* ExecutorRun per nested statement, since it still
+# temporarily activates a wrongly-.detached span for the one
+# ExecutorRun it belongs to. So this scenario is a regression/sanity
+# check (no crash, correct results, correct nesting) rather than one
+# that fails pre-fix; the fix's necessity is established by the
+# diagnostic above and by code inspection (a wrongly-.detached span's
+# bookkeeping entry is, for the wrong reason, treated as a cursor by
+# otel_ExecutorRun()'s peek_cursor_span(), which does not generalise
+# safely, e.g. to a nested statement run more than once).
+# ----------------------------------------------------------------------
+
+{
+	$node->safe_psql(
+		'postgres', q{
+			CREATE OR REPLACE FUNCTION cursor_test_leaf() RETURNS int AS $f$
+			DECLARE r int;
+			BEGIN
+				SELECT count(*) INTO r FROM generate_series(1,3);
+				RETURN r;
+			END $f$ LANGUAGE plpgsql;
+
+			CREATE OR REPLACE FUNCTION cursor_test_folded(i int) RETURNS int AS $f$
+			BEGIN
+				RETURN i + (SELECT cursor_test_leaf());
+			END $f$ LANGUAGE plpgsql IMMUTABLE;
+		});
+
+	my $log_start = -s $node->logfile;
+	my $out = $node->safe_psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			SELECT test_otel_clear();
+			BEGIN;
+			DECLARE c CURSOR FOR SELECT cursor_test_folded(1);
+			FETCH 1 FROM c;
+			CLOSE c;
+			COMMIT;
+			SELECT test_otel_pop_span() FROM generate_series(1, 30);
+		});
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	unlike($log, qr/TRAP:|Assert/,
+		'constant-folded nested statement during DECLARE CURSOR planning: no crash'
+	);
+	unlike($log, qr/otel_api: span .* still open above it/,
+		'...and no non-LIFO WARNING');
+
+	my ($folded_span) = grep {
+		/name=pgsql\.execute\n/ && /db\.query\.text=i \+ \(SELECT cursor_test_leaf/
+	} split /(?=scope\.name=)/, $out;
+	my ($leaf_span) = grep {
+		/name=pgsql\.execute\n/
+		  && /db\.query\.text=SELECT count\(\*\)\s+FROM generate_series/
+	} split /(?=scope\.name=)/, $out;
+	ok(defined $folded_span && defined $leaf_span,
+		'both the folded expression and the leaf statement were captured');
+	SKIP:
+	{
+		skip 'spans not found', 1 unless $folded_span && $leaf_span;
+		my ($folded_id) = $folded_span =~ /span_id=([0-9a-f]+)/;
+		my ($leaf_parent) = $leaf_span =~ /parent_span_id=([0-9a-f]+)/;
+		is($leaf_parent, $folded_id,
+			'the leaf statement correctly nests under the folded expression\'s own span'
+		);
+	}
+}
+
 done_testing();
