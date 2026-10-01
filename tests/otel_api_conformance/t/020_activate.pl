@@ -95,6 +95,7 @@ sub check_misuse
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
+BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.detached', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_span_current() = 0 AS none_current_before;
 SELECT otel_api_conformance_activate(:s) AS tok \gset
@@ -103,6 +104,7 @@ SELECT otel_api_conformance_span_current() = :s AS span_is_current;
 SELECT otel_api_conformance_deactivate(:tok);
 SELECT otel_api_conformance_span_current() = 0 AS none_current_after;
 SELECT otel_api_conformance_end(:s);
+COMMIT;
 SQL
 	my @lines = grep { length } split /\n/, $out;
 	is($lines[0], 't', 'nothing current before activation');
@@ -117,6 +119,7 @@ SQL
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
+BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.parent', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_start('conformance.activate.child', owner_mode := 'session') AS child \gset
@@ -124,6 +127,7 @@ SELECT otel_api_conformance_end(:child);
 SELECT otel_api_conformance_deactivate(:tok);
 SELECT otel_api_conformance_end(:s);
 SELECT otel_api_conformance_spans();
+COMMIT;
 SQL
 	like($out, qr/"name":\s*"conformance\.activate\.child".*"parent_span_id"/s,
 		'child span recorded');
@@ -135,9 +139,11 @@ SQL
 # ----------------------------------------------------------------
 check_misuse(
 	'activate a non-.detached span',
-	q{SELECT otel_api_conformance_start('conformance.activate.misuse.not_detached', owner_mode := 'session') AS s \gset
+	q{BEGIN;
+SELECT otel_api_conformance_start('conformance.activate.misuse.not_detached', owner_mode := 'session') AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok2 \gset
-SELECT otel_api_conformance_end(:s);},
+SELECT otel_api_conformance_end(:s);
+COMMIT;},
 	'activate_not_detached');
 
 # ----------------------------------------------------------------
@@ -145,11 +151,13 @@ SELECT otel_api_conformance_end(:s);},
 # ----------------------------------------------------------------
 check_misuse(
 	'activate an already-active span',
-	q{SELECT otel_api_conformance_start('conformance.activate.misuse.already_active', owner_mode := 'session', detached := true) AS s \gset
+	q{BEGIN;
+SELECT otel_api_conformance_start('conformance.activate.misuse.already_active', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_activate(:s) AS tok2 \gset
 SELECT otel_api_conformance_deactivate(:tok);
-SELECT otel_api_conformance_end(:s);},
+SELECT otel_api_conformance_end(:s);
+COMMIT;},
 	'activate_already_active');
 
 # ----------------------------------------------------------------
@@ -161,12 +169,14 @@ SELECT otel_api_conformance_end(:s);},
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
+BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.end_while_active', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_span_current() = :s AS span_is_current;
 SELECT otel_api_conformance_end(:s);
 SELECT otel_api_conformance_span_current() = 0 AS none_current_after_end;
 SELECT otel_api_conformance_counters();
+COMMIT;
 SQL
 	my @lines = grep { length } split /\n/, $out;
 	is($lines[0], 't', 'span is current before ending it');
@@ -185,10 +195,12 @@ SQL
 # ----------------------------------------------------------------
 check_misuse(
 	'deactivate with a stale token (span already ended)',
-	q{SELECT otel_api_conformance_start('conformance.activate.misuse.stale', owner_mode := 'session', detached := true) AS s \gset
+	q{BEGIN;
+SELECT otel_api_conformance_start('conformance.activate.misuse.stale', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_end(:s);
-SELECT otel_api_conformance_deactivate(:tok);},
+SELECT otel_api_conformance_deactivate(:tok);
+COMMIT;},
 	'stale_handle');
 
 # ----------------------------------------------------------------
@@ -197,11 +209,13 @@ SELECT otel_api_conformance_deactivate(:tok);},
 # ----------------------------------------------------------------
 check_misuse(
 	'deactivate twice',
-	q{SELECT otel_api_conformance_start('conformance.activate.misuse.double_deactivate', owner_mode := 'session', detached := true) AS s \gset
+	q{BEGIN;
+SELECT otel_api_conformance_start('conformance.activate.misuse.double_deactivate', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_deactivate(:tok);
 SELECT otel_api_conformance_deactivate(:tok);
-SELECT otel_api_conformance_end(:s);},
+SELECT otel_api_conformance_end(:s);
+COMMIT;},
 	'deactivate_not_active');
 
 # ----------------------------------------------------------------
@@ -214,11 +228,13 @@ SELECT otel_api_conformance_end(:s);},
 # ----------------------------------------------------------------
 check_misuse(
 	'deactivate with a span pushed above it since',
-	q{SELECT otel_api_conformance_start('conformance.activate.nonlifo', owner_mode := 'session', detached := true) AS s \gset
+	q{BEGIN;
+SELECT otel_api_conformance_start('conformance.activate.nonlifo', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT otel_api_conformance_start('conformance.activate.nonlifo.above', owner_mode := 'session') AS above \gset
 SELECT otel_api_conformance_deactivate(:tok);
-SELECT otel_api_conformance_end(:s);},
+SELECT otel_api_conformance_end(:s);
+COMMIT;},
 	'non_lifo_end');
 
 # ----------------------------------------------------------------
