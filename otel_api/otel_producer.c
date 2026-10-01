@@ -1379,7 +1379,13 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 		if (n == NULL)
 			return;
 		idx = n - nrecs;
-		if (!n->detached && (pos = stack_find(stack_entry_for_nrec(idx))) >= 0)
+
+		/*
+		 * Search the stack regardless of .detached: a .detached entry
+		 * that is currently active (otel_span_activate()) is on the
+		 * stack too, and must be popped the same way.
+		 */
+		if ((pos = stack_find(stack_entry_for_nrec(idx))) >= 0)
 		{
 			if (pos != span_stack_depth - 1)
 			{
@@ -1399,7 +1405,9 @@ api_span_end(OtelSpanRef s, TimestampTz end_time)
 		if (slot == NULL)
 			return;
 		idx = slot - slots;
-		if (!slot->detached && (pos = stack_find(stack_entry_for_slot(idx))) >= 0)
+
+		/* See the .detached comment in the s.v < 0 branch above. */
+		if ((pos = stack_find(stack_entry_for_slot(idx))) >= 0)
 		{
 			if (pos != span_stack_depth - 1)
 			{
@@ -1814,6 +1822,130 @@ api_span_discard(OtelSpanRef s)
 	otel_counters.spans_discarded++;
 }
 
+/*
+ * Push a .detached, still-open span onto the active stack.  Refused
+ * (OTEL_ACTIVATION_NONE, counted) for a stale handle, a non-.detached
+ * span (already on the stack from otel_span_start()), a span that is
+ * already active, or a full stack.  The encoding mirrors make_ref():
+ * an activation token and the span's own handle name the same (gen,
+ * idx) pair, which is enough to find it again in otel_span_deactivate()
+ * and to detect a stale token the same way slot_for_ref()/nrec_for_ref()
+ * do for a span handle.
+ */
+static OtelActivation
+api_span_activate(OtelSpanRef s)
+{
+	int			idx;
+	int32		entry;
+	uint32		gen;
+	bool		recording;
+
+	if (call_refused(false) || s.v == 0)
+		return OTEL_ACTIVATION_NONE;
+
+	if (s.v > 0)
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return OTEL_ACTIVATION_NONE;
+		if (!slot->detached)
+		{
+			otel_counters.activate_not_detached++;
+			Assert(false);		/* only a .detached span may be activated */
+			return OTEL_ACTIVATION_NONE;
+		}
+		idx = slot - slots;
+		entry = stack_entry_for_slot(idx);
+		gen = slot->gen;
+		recording = true;
+	}
+	else
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return OTEL_ACTIVATION_NONE;
+		if (!n->detached)
+		{
+			otel_counters.activate_not_detached++;
+			Assert(false);
+			return OTEL_ACTIVATION_NONE;
+		}
+		idx = n - nrecs;
+		entry = stack_entry_for_nrec(idx);
+		gen = n->gen;
+		recording = false;
+	}
+
+	if (stack_find(entry) >= 0)
+	{
+		otel_counters.activate_already_active++;
+		Assert(false);			/* span is already active */
+		return OTEL_ACTIVATION_NONE;
+	}
+	if (span_stack_depth >= OTEL_MAX_STACK_DEPTH)
+	{
+		otel_counters.start_stack_full++;
+		return OTEL_ACTIVATION_NONE;
+	}
+
+	span_stack[span_stack_depth++] = entry;
+	return (OtelActivation) {make_ref(gen, idx, recording).v};
+}
+
+/*
+ * Pop an activation.  Checked exactly like otel_span_end(): entries
+ * pushed above it since are unwound first (LIFO violation, WARNING,
+ * Assert in cassert builds), same as ending a span out of order.  A
+ * stale token (the span already ended, or this token already
+ * deactivated) is a quiet no-op via slot_for_ref()/nrec_for_ref(),
+ * except that a token whose span is still open but no longer on the
+ * stack (a double deactivate) is its own counted misuse, since neither
+ * of those helpers can tell that case apart from a fresh stale handle.
+ */
+static void
+api_span_deactivate(OtelActivation tok)
+{
+	OtelSpanRef s = {tok.v};
+	int32		entry;
+	int			pos;
+
+	if (call_refused(false) || tok.v == 0)
+		return;
+
+	if (s.v > 0)
+	{
+		OtelSlot   *slot = slot_for_ref(s);
+
+		if (slot == NULL)
+			return;				/* stale: already ended */
+		entry = stack_entry_for_slot(slot - slots);
+	}
+	else
+	{
+		OtelNrec   *n = nrec_for_ref(s);
+
+		if (n == NULL)
+			return;				/* stale: already ended */
+		entry = stack_entry_for_nrec(n - nrecs);
+	}
+
+	pos = stack_find(entry);
+	if (pos < 0)
+	{
+		otel_counters.deactivate_not_active++;
+		Assert(false);			/* not currently active (double deactivate?) */
+		return;
+	}
+	if (pos != span_stack_depth - 1)
+	{
+		nonlifo_warning("span deactivated with spans still open above it", pos);
+		stack_unwind_above(pos, "parent activation deactivated first");
+	}
+	span_stack_depth--;
+}
+
 const OtelProducerApi otel_producer_api_table = {
 	.version = OTEL_PRODUCER_API_VERSION,
 	.struct_size = sizeof(OtelProducerApi),
@@ -1835,6 +1967,8 @@ const OtelProducerApi otel_producer_api_table = {
 	.span_context_of = api_span_context_of,
 	.resource_add = api_resource_add,
 	.span_discard = api_span_discard,
+	.span_activate = api_span_activate,
+	.span_deactivate = api_span_deactivate,
 };
 
 
@@ -1962,6 +2096,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 		F(leaked_at_commit), F(dropped_in_dispatch), F(open_at_exit),
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),
 		F(error_capture_failed), F(emit_hook_errors),
+		F(activate_not_detached), F(activate_already_active), F(deactivate_not_active),
 #undef F
 	};
 

@@ -41,6 +41,20 @@
  *	   every statement, including each statement of a plpgsql function.
  *	   A span that starts in one statement and ends in another must be
  *	   .detached.
+ *	 - A .detached span can still be made current, so later work parents
+ *	   to it: otel_span_activate(s) pushes it onto the active stack and
+ *	   returns a token; otel_span_deactivate(token) pops it again.  Only
+ *	   a .detached, still-open span may be activated; a non-detached
+ *	   span is already on the stack from otel_span_start(), and
+ *	   activating it again, or activating it twice, is refused (counted;
+ *	   an Assert failure in cassert builds).  An activation is checked
+ *	   the same way as any other stack entry: deactivating one with
+ *	   others pushed above it ends those first (LIFO violation,
+ *	   WARNING), exactly as otel_span_end() does.  Ending the span
+ *	   itself while it is still active pops it off the stack like any
+ *	   other entry -- deactivate it first if you also hold the token, or
+ *	   the token becomes a stale handle (same as using one after
+ *	   otel_span_end() elsewhere).
  *
  * Lifetime.  Every recording span belongs to a resource owner: by default
  * CurrentResourceOwner, or the one given in .owner.  When the owner is
@@ -76,7 +90,7 @@
 #include "otel_api.h"
 
 #define OTEL_PRODUCER_API_MAJOR		1
-#define OTEL_PRODUCER_API_MINOR		0
+#define OTEL_PRODUCER_API_MINOR		1
 #define OTEL_PRODUCER_API_VERSION	OTEL_MAKE_VERSION(OTEL_PRODUCER_API_MAJOR, \
 													  OTEL_PRODUCER_API_MINOR)
 
@@ -100,6 +114,18 @@ otel_span_recording(OtelSpanRef s)
 {
 	return s.v > 0;
 }
+
+/*
+ * Token from otel_span_activate(), for otel_span_deactivate().  Opaque;
+ * valid only in the backend that created it, and only until the
+ * activated span ends or is deactivated.
+ */
+typedef struct OtelActivation
+{
+	int64		v;
+} OtelActivation;
+
+#define OTEL_ACTIVATION_NONE	((OtelActivation) {0})
 
 /*
  * A producer's tracer (OTel InstrumentationScope).  Declare one static
@@ -239,6 +265,24 @@ typedef struct OtelProducerApi
 	 * abort callback.
 	 */
 	void		(*span_discard) (OtelSpanRef s);
+
+	/*
+	 * Push a .detached, still-open span onto the active stack so it
+	 * becomes current; new spans using OTEL_PARENT_ACTIVE parent to it.
+	 * Returns OTEL_ACTIVATION_NONE, refused and counted, for: s ==
+	 * OTEL_SPAN_NONE; a stale s; a non-.detached span (it is already on
+	 * the stack); a span already active; or the active stack being full.
+	 */
+	OtelActivation (*span_activate) (OtelSpanRef s);
+
+	/*
+	 * Pop an activation.  Checked exactly like otel_span_end(): if other
+	 * entries were pushed above it since, they are ended first (LIFO
+	 * violation, WARNING, each exported with ERROR status), same as
+	 * ending a span out of order.  A stale or already-deactivated token
+	 * is refused and counted, same as a stale span handle.
+	 */
+	void		(*span_deactivate) (OtelActivation tok);
 } OtelProducerApi;
 
 
@@ -307,6 +351,23 @@ otel_span_discard(OtelSpanRef s)
 {
 	if (s.v != 0)
 		otel_producer_api()->span_discard(s);
+}
+
+static inline OtelActivation
+otel_span_activate(OtelSpanRef s)
+{
+	const OtelProducerApi *p = otel_producer_api();
+
+	if (p == NULL || s.v == 0)
+		return OTEL_ACTIVATION_NONE;
+	return p->span_activate(s);
+}
+
+static inline void
+otel_span_deactivate(OtelActivation tok)
+{
+	if (tok.v != 0)
+		otel_producer_api()->span_deactivate(tok);
 }
 
 static inline void

@@ -40,6 +40,13 @@ typedef struct OtelSpanRef
 
 #define OTEL_SPAN_NONE	((OtelSpanRef) {0})
 
+typedef struct OtelActivation
+{
+	int64		v;
+} OtelActivation;
+
+#define OTEL_ACTIVATION_NONE	((OtelActivation) {0})
+
 typedef struct OtelTracer
 {
 	const char *name;
@@ -81,6 +88,8 @@ static inline OtelSpanRef otel_span_start_args(const OtelSpanStartArgs *args) { 
 		.struct_size = sizeof(OtelSpanStartArgs), __VA_ARGS__ })
 static inline void otel_span_end(OtelSpanRef s) { (void) s; }
 static inline void otel_span_discard(OtelSpanRef s) { (void) s; }
+static inline OtelActivation otel_span_activate(OtelSpanRef s) { (void) s; return OTEL_ACTIVATION_NONE; }
+static inline void otel_span_deactivate(OtelActivation tok) { (void) tok; }
 static inline void otel_span_end_at(OtelSpanRef s, TimestampTz t) { (void) s; (void) t; }
 static inline void otel_span_set_str(OtelSpanRef s, const char *k, const char *v) { (void) s; (void) k; (void) v; }
 static inline void otel_span_set_int(OtelSpanRef s, const char *k, int64 v) { (void) s; (void) k; (void) v; }

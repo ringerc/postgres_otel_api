@@ -21,7 +21,7 @@
 #include "otel_api.h"
 
 #define OTEL_INTERNAL_API_MAJOR		1
-#define OTEL_INTERNAL_API_MINOR		0
+#define OTEL_INTERNAL_API_MINOR		1
 #define OTEL_INTERNAL_API_VERSION	OTEL_MAKE_VERSION(OTEL_INTERNAL_API_MAJOR, \
 													  OTEL_INTERNAL_API_MINOR)
 
@@ -68,6 +68,11 @@ typedef struct OtelApiCounters
 	uint64		link_dropped;
 	uint64		error_capture_failed;
 	uint64		emit_hook_errors;	/* ERRORs raised by emit hooks */
+
+	/* otel_span_activate() / otel_span_deactivate() misuse, refused */
+	uint64		activate_not_detached;	/* span isn't .detached */
+	uint64		activate_already_active;	/* span is already on the stack */
+	uint64		deactivate_not_active;	/* token isn't currently active */
 } OtelApiCounters;
 
 typedef struct OtelInternalApi
