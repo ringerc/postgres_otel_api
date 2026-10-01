@@ -6,9 +6,13 @@
  * This module is simultaneously:
  *
  *	 - an exporter: it registers an emit hook (deep-copies every emitted
- *	   span into a backend-local capture list) and a sampler hook (whose
- *	   decision is controlled by the otel_api_conformance.sampler GUC),
- *	   both via otel_exporter_register_when_ready() from _PG_init;
+ *	   span into a backend-local capture list) via
+ *	   otel_exporter_register_when_ready() from _PG_init.  Sampling is
+ *	   otel_api's own policy (otel_api.sampler / otel_api.sampler_arg,
+ *	   postgres-cdq.18); this module has no sampler hook of its own and
+ *	   drives the sampler matrix entirely by setting those two GUCs and
+ *	   by the parent kind it asks otel_api_conformance_start() to use
+ *	   (root / context / active / span).
  *
  *	 - a producer: SQL-callable C functions, each running one scenario
  *	   from the P2 design's conformance test-suite list, using two
@@ -16,17 +20,6 @@
  *	   or b) to exercise the multi-producer patterns.
  *
  * Design choices worth documenting:
- *
- *	 - The sampler hook is *always* registered (never left unregistered),
- *	   and it consults otel_api_conformance.sampler on every call, rather
- *	   than being conditionally registered based on the GUC.  This keeps
- *	   sampler-call counting available at all times (needed by the
- *	   unsampled-trace tests) without a load-order dependency on when the
- *	   GUC is first set.  "none" approximates the OTel default
- *	   ParentBased(AlwaysOn) sampler using the sampler input's remote
- *	   parent (if any), so that with the GUC left at its default, this
- *	   module behaves like "no sampler hook installed" from a producer's
- *	   point of view, while still counting invocations.
  *
  *	 - Captured spans are kept in an unbounded (repalloc-grown) array in
  *	   a dedicated MemoryContext, not a fixed ring: the conformance suite
@@ -99,29 +92,6 @@ extern PGDLLEXPORT void otel_api_conformance_oom_callback(const char *name,
 static OtelTracer tracer_a = {.name = "otel_api_conformance.a", .version = "0.1"};
 static OtelTracer tracer_b = {.name = "otel_api_conformance.b", .version = "0.1"};
 
-/* ----------------------------------------------------------------
- * GUC: what the sampler hook returns.
- * ---------------------------------------------------------------- */
-
-typedef enum ConformanceSamplerMode
-{
-	CONFORMANCE_SAMPLER_NONE = 0,
-	CONFORMANCE_SAMPLER_DROP,
-	CONFORMANCE_SAMPLER_RECORD_ONLY,
-	CONFORMANCE_SAMPLER_RECORD,
-} ConformanceSamplerMode;
-
-static int	conformance_sampler_mode = CONFORMANCE_SAMPLER_NONE;
-
-static const struct config_enum_entry conformance_sampler_options[] = {
-	{"none", CONFORMANCE_SAMPLER_NONE, false},
-	{"drop", CONFORMANCE_SAMPLER_DROP, false},
-	{"record_only", CONFORMANCE_SAMPLER_RECORD_ONLY, false},
-	{"record", CONFORMANCE_SAMPLER_RECORD, false},
-	{NULL, 0, false},
-};
-
-static int64 conformance_sampler_calls = 0;
 static int64 conformance_side_effect_calls = 0;
 
 /* ----------------------------------------------------------------
@@ -194,7 +164,6 @@ static int	n_captured = 0;
 static int	captured_cap = 0;
 
 static otel_span_emit_hook_type prev_emit_hook = NULL;
-static otel_sampler_hook_type prev_sampler_hook = NULL;
 static OtelPendingRegistration pending_reg;
 
 /* Exporter misbehaviour during dispatch (t/017); see below. */
@@ -475,34 +444,6 @@ conformance_emit_hook(const OtelSpan *span)
 		prev_emit_hook(span);
 }
 
-/*
- * Always registered; consults otel_api_conformance.sampler on every
- * call.  "none" mirrors the OTel default ParentBased(AlwaysOn) sampler
- * using the remote parent's sampled bit, so leaving the GUC at its
- * default doesn't change behaviour versus no sampler hook at all, while
- * still letting the conformance suite count invocations.
- */
-static OtelSamplerDecision
-conformance_sampler_hook(const OtelSamplerInput *in)
-{
-	conformance_sampler_calls++;
-	switch (conformance_sampler_mode)
-	{
-		case CONFORMANCE_SAMPLER_DROP:
-			return OTEL_SAMPLE_DROP;
-		case CONFORMANCE_SAMPLER_RECORD_ONLY:
-			return OTEL_SAMPLE_RECORD_ONLY;
-		case CONFORMANCE_SAMPLER_RECORD:
-			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-		case CONFORMANCE_SAMPLER_NONE:
-		default:
-			if (in->parent != NULL && otel_span_context_is_valid(in->parent))
-				return otel_span_context_sampled(in->parent)
-					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
-			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-	}
-}
-
 /* ----------------------------------------------------------------
  * _PG_init
  * ---------------------------------------------------------------- */
@@ -520,15 +461,6 @@ _PG_init(void)
 										   "otel_api_conformance misbehaviour",
 										   ALLOCSET_SMALL_SIZES);
 
-	DefineCustomEnumVariable("otel_api_conformance.sampler",
-							  "Decision returned by otel_api_conformance's sampler hook.",
-							  NULL,
-							  &conformance_sampler_mode,
-							  CONFORMANCE_SAMPLER_NONE,
-							  conformance_sampler_options,
-							  PGC_USERSET,
-							  0,
-							  NULL, NULL, NULL);
 	DefineCustomBoolVariable("otel_api_conformance.capture_spans",
 							  "Whether the emit hook deep-copies spans into the capture list.",
 							  "Off for memory-bound stress scenarios, so the measurement isolates "
@@ -543,8 +475,6 @@ _PG_init(void)
 	memset(&pending_reg, 0, sizeof(pending_reg));
 	pending_reg.emit_hook = conformance_emit_hook;
 	pending_reg.emit_prev_out = &prev_emit_hook;
-	pending_reg.sampler_hook = conformance_sampler_hook;
-	pending_reg.sampler_prev_out = &prev_sampler_hook;
 	otel_exporter_register_when_ready(&pending_reg);
 
 	/*
@@ -738,7 +668,6 @@ otel_api_conformance_reset(PG_FUNCTION_ARGS)
 	captured = NULL;
 	n_captured = 0;
 	captured_cap = 0;
-	conformance_sampler_calls = 0;
 	conformance_side_effect_calls = 0;
 	PG_RETURN_VOID();
 }
@@ -820,7 +749,6 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"deactivate_not_active\":" UINT64_FORMAT ","
 					  "\"activation_unwound\":" UINT64_FORMAT ","
 					  "\"activation_leaked_at_commit\":" UINT64_FORMAT ","
-					  "\"conformance_sampler_calls\":" INT64_FORMAT ","
 					  "\"conformance_side_effect_calls\":" INT64_FORMAT ","
 					  "\"conformance_captured\":%d"
 					  "}",
@@ -834,16 +762,9 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  c.activate_not_detached, c.activate_already_active,
 					  c.deactivate_not_active,
 					  c.activation_unwound, c.activation_leaked_at_commit,
-					  conformance_sampler_calls, conformance_side_effect_calls,
+					  conformance_side_effect_calls,
 					  n_captured);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
-}
-
-PG_FUNCTION_INFO_V1(otel_api_conformance_sampler_calls);
-Datum
-otel_api_conformance_sampler_calls(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64(conformance_sampler_calls);
 }
 
 /* ----------------------------------------------------------------

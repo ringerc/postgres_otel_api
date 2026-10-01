@@ -3,7 +3,7 @@
 \echo Use "CREATE EXTENSION otel_api_conformance" to load this file. \quit
 
 -- ----------------------------------------------------------------
--- Exporter side: captured spans, counters, sampler-call count.
+-- Exporter side: captured spans, counters.
 -- ----------------------------------------------------------------
 
 CREATE FUNCTION otel_api_conformance_reset()
@@ -19,11 +19,6 @@ LANGUAGE C VOLATILE STRICT;
 CREATE FUNCTION otel_api_conformance_counters()
 RETURNS jsonb
 AS 'MODULE_PATHNAME', 'otel_api_conformance_counters'
-LANGUAGE C VOLATILE STRICT;
-
-CREATE FUNCTION otel_api_conformance_sampler_calls()
-RETURNS bigint
-AS 'MODULE_PATHNAME', 'otel_api_conformance_sampler_calls'
 LANGUAGE C VOLATILE STRICT;
 
 -- ----------------------------------------------------------------

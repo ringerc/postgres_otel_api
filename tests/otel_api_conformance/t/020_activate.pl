@@ -260,7 +260,7 @@ SQL
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.unsampled', owner_mode := 'session', detached := true) AS s \gset
 SELECT :s < 0 AS unsampled;

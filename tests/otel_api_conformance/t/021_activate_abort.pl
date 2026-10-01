@@ -209,20 +209,20 @@ SQL
 
 # ----------------------------------------------------------------
 # Defect 1d: the unsampled (nrec) variant -- same top-level-abort
-# shape, with otel_api_conformance.sampler = 'drop'.
+# shape, with otel_api.sampler = 'always_off'.
 # ----------------------------------------------------------------
 {
 	my ($ret, $stdout, $stderr) = $node->psql(
 		'postgres', <<'SQL',
 SELECT otel_api_conformance_reset() AS r1 \gset
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.abort.nrec', owner_mode := 'session', detached := true) AS s \gset
 SELECT :s < 0 AS unsampled;
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT 1/0;
 ROLLBACK;
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 SELECT otel_api_conformance_span_current() AS cur;
 SELECT otel_api_conformance_end(:s);
 SQL

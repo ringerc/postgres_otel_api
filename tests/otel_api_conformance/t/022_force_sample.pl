@@ -43,7 +43,7 @@ my $span_id  = '0011223344556677';
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 BEGIN;
 SELECT otel_api_conformance_start('conformance.force_root',
 	parent_mode => 'root', owner_mode => 'toptxn', force_sample => true) AS s \gset
@@ -113,7 +113,7 @@ SQL
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 BEGIN;
 SELECT otel_api_conformance_start('conformance.local_unsampled_parent') AS parent \gset
 SELECT otel_api_conformance_recording(:parent) AS parent_recording;

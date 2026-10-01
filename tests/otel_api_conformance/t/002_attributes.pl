@@ -164,7 +164,7 @@ SQL
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api_conformance.sampler = 'drop';
+SET otel_api.sampler = 'always_off';
 SELECT otel_api_conformance_side_effect_count() AS before_count \gset
 BEGIN;
 SELECT otel_api_conformance_start('conformance.unsampled_side_effect', owner_mode => 'toptxn') AS s \gset
@@ -180,7 +180,7 @@ SQL
 }
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api_conformance.sampler = 'record';
+SET otel_api.sampler = 'always_on';
 SELECT otel_api_conformance_side_effect_count() AS before_count \gset
 BEGIN;
 SELECT otel_api_conformance_start('conformance.sampled_side_effect', owner_mode => 'toptxn') AS s \gset
