@@ -136,7 +136,7 @@ SQL
 check_misuse(
 	'activate a non-.detached span',
 	q{SELECT otel_api_conformance_start('conformance.activate.misuse.not_detached', owner_mode := 'session') AS s \gset
-SELECT otel_api_conformance_activate(:s);
+SELECT otel_api_conformance_activate(:s) AS tok2 \gset
 SELECT otel_api_conformance_end(:s);},
 	'activate_not_detached');
 
@@ -147,7 +147,7 @@ check_misuse(
 	'activate an already-active span',
 	q{SELECT otel_api_conformance_start('conformance.activate.misuse.already_active', owner_mode := 'session', detached := true) AS s \gset
 SELECT otel_api_conformance_activate(:s) AS tok \gset
-SELECT otel_api_conformance_activate(:s);
+SELECT otel_api_conformance_activate(:s) AS tok2 \gset
 SELECT otel_api_conformance_deactivate(:tok);
 SELECT otel_api_conformance_end(:s);},
 	'activate_already_active');
