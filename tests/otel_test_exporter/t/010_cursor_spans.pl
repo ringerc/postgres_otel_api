@@ -42,7 +42,8 @@ $node->init;
 $node->append_conf('postgresql.conf',
 	"shared_preload_libraries = 'otel_api,otel_postgres_tracing,test_otel_exporter'\n"
 	  . "restart_after_crash = on\n"
-	  . "log_min_messages = warning\n");
+	  . "log_min_messages = warning\n"
+	  . "otel_api.emit_spans_to_log = on\n");
 $node->start;
 
 $node->safe_psql('postgres',
@@ -195,19 +196,11 @@ note("debug_assertions = $cassert");
 # ----------------------------------------------------------------------
 # Scenario 5: a FETCH that errors deactivates the cursor span cleanly
 # (PG_FINALLY in otel_ExecutorRun()) rather than crashing or leaving
-# the active stack imbalanced.
-#
-# Note: recovering the session afterwards (ROLLBACK, or ROLLBACK TO
-# SAVEPOINT) while otel.trace_all_queries is on hits an unrelated,
-# pre-existing defect in otel_trace.c's start_stmt_span(): it calls
-# get_database_name() unconditionally, which asserts
-# IsTransactionState() and crashes when a utility statement's span is
-# started while the transaction is in aborted-block state (i.e. for
-# the ROLLBACK/ROLLBACK TO SAVEPOINT that recovers from *any* error
-# inside an explicit BEGIN, not just a cursor's). That is out of scope
-# for postgres-cdq.10 (not related to otel_span_activate/deactivate or
-# .detached) and is not exercised further here; this scenario only
-# checks the FETCH error itself, not recovery from it.
+# the active stack imbalanced. Recovering the session afterwards with
+# ROLLBACK no longer crashes (postgres-cdq.21: start_stmt_span() used
+# to call get_database_name(), which asserts IsTransactionState() and
+# crashed when a utility statement's span -- ROLLBACK's own -- started
+# while the transaction was in aborted-block state).
 # ----------------------------------------------------------------------
 
 {
@@ -219,17 +212,86 @@ note("debug_assertions = $cassert");
 			DECLARE e CURSOR FOR SELECT 1/(i-2) FROM generate_series(1,3) i;
 			FETCH 1 FROM e;
 			FETCH 1 FROM e;
+			ROLLBACK;
 		},
 		on_error_stop => 0);
 	like($stderr, qr/division by zero/,
 		'the second FETCH reports the division-by-zero error');
 	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
 	unlike($log, qr/TRAP:|Assert/,
-		'no crash from the erroring FETCH itself');
+		'no crash from the erroring FETCH, or from the ROLLBACK that recovers'
+	);
+	is($ret, 0, 'the ROLLBACK itself succeeds (recovers the session)');
 
 	# The postmaster, and other backends, are unaffected.
 	is($node->safe_psql('postgres', 'SELECT 1'), '1',
 		'the postmaster is healthy after the erroring FETCH');
+}
+
+# ----------------------------------------------------------------------
+# Scenario 7 (postgres-cdq.21): ROLLBACK, and ROLLBACK TO SAVEPOINT,
+# after an error inside an explicit BEGIN, with otel.trace_all_queries
+# on, no longer crash a cassert backend -- and the recovering
+# statement's own span still carries db.namespace and pg.database.oid,
+# now set from MyProcPort->database_name / MyDatabaseId instead of
+# get_database_name().
+# ----------------------------------------------------------------------
+
+{
+	my $log_start = -s $node->logfile;
+	my ($ret, $stdout, $stderr) = $node->psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			BEGIN;
+			SELECT 1/0;
+			ROLLBACK;
+		},
+		on_error_stop => 0);
+	like($stderr, qr/division by zero/, 'ROLLBACK scenario: the induced error');
+	is($ret, 0, 'ROLLBACK after an error completes without crashing');
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	unlike($log, qr/TRAP:|Assert/, 'ROLLBACK scenario: no crash in the log');
+
+	$log_start = -s $node->logfile;
+	($ret, $stdout, $stderr) = $node->psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			BEGIN;
+			SAVEPOINT s1;
+			SELECT 1/0;
+			ROLLBACK TO SAVEPOINT s1;
+			COMMIT;
+		},
+		on_error_stop => 0);
+	like($stderr, qr/division by zero/,
+		'ROLLBACK TO SAVEPOINT scenario: the induced error');
+	is($ret, 0, 'ROLLBACK TO SAVEPOINT after an error completes without crashing'
+	);
+	$log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	unlike($log, qr/TRAP:|Assert/,
+		'ROLLBACK TO SAVEPOINT scenario: no crash in the log');
+
+	# db.namespace and pg.database.oid are present on an ordinary
+	# client-backend span (BEGIN's own utility span, captured via the
+	# JSON log emitter, already on for this whole file).
+	$log_start = -s $node->logfile;
+	$node->safe_psql(
+		'postgres', q{
+			SET otel.trace_all_queries = on;
+			BEGIN;
+			COMMIT;
+		});
+	$log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_start);
+	my ($span_line) = grep { /"name":"BEGIN"/ } split /\n/, $log;
+	ok(defined $span_line, 'found the BEGIN span in the log emitter output');
+	SKIP:
+	{
+		skip 'BEGIN span not found', 2 unless defined $span_line;
+		like($span_line, qr/"db\.namespace":"postgres"/,
+			'db.namespace is set (from MyProcPort->database_name)');
+		like($span_line, qr/"pg\.database\.oid":\d+/,
+			'pg.database.oid is set (from MyDatabaseId)');
+	}
 }
 
 # ----------------------------------------------------------------------
