@@ -324,20 +324,40 @@ otel_producer_api(void)
 	}
 }
 
-static inline OtelSpanRef
-otel_span_start_args(const OtelSpanStartArgs *args)
+/*
+ * The gate otel_span_start() needs, split out so the macro can test it
+ * before building an OtelSpanStartArgs: with nothing to record, no
+ * struct should ever be materialised.  Also used by
+ * otel_span_start_args() itself, so a direct call gets the same check.
+ */
+static inline bool
+otel_recording_possible_(void)
 {
 	const OtelProducerApi *p = otel_producer_api();
 
-	if (p == NULL || !*p->recording_possible)
-		return OTEL_SPAN_NONE;
-	return p->span_start(args);
+	return p != NULL && *p->recording_possible;
 }
 
-/* otel_span_start(.name = ..., ...): designated initialisers for args. */
+static inline OtelSpanRef
+otel_span_start_args(const OtelSpanStartArgs *args)
+{
+	if (!otel_recording_possible_())
+		return OTEL_SPAN_NONE;
+	return otel_producer_api()->span_start(args);
+}
+
+/*
+ * otel_span_start(.name = ..., ...): designated initialisers for args.
+ *
+ * The gate is checked first, as the condition of a ?:, so the compound
+ * literal is only ever constructed on the branch that is actually taken:
+ * with recording not possible, nothing is stored to build it.
+ */
 #define otel_span_start(...) \
-	otel_span_start_args(&(OtelSpanStartArgs) { \
-		.struct_size = sizeof(OtelSpanStartArgs), __VA_ARGS__ })
+	(otel_recording_possible_() \
+	 ? otel_span_start_args(&(OtelSpanStartArgs) { \
+			.struct_size = sizeof(OtelSpanStartArgs), __VA_ARGS__ }) \
+	 : OTEL_SPAN_NONE)
 
 static inline void
 otel_span_end(OtelSpanRef s)
