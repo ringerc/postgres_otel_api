@@ -42,6 +42,7 @@
 #include "executor/executor.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "tcop/cmdtag.h"
@@ -79,6 +80,13 @@
  * here too: their spans are ended (and exported with ERROR status) by
  * otel_api's own resource-owner release, so this is bookkeeping
  * cleanup only, not span cleanup.
+ *
+ * detached marks a cursor's executor span (see
+ * otel_declaring_cursor_portal below): it is .detached, so it does not
+ * sit on otel_api's active stack across the statements between
+ * DECLARE and CLOSE/portal-drop.  otel_ExecutorRun() looks entries up
+ * by key (without removing them) to activate/deactivate it around the
+ * one ExecutorRun call that belongs to its FETCH.
  */
 #define OTEL_STMT_STACK_MAX 32
 typedef struct StmtSpanEntry
@@ -86,10 +94,19 @@ typedef struct StmtSpanEntry
 	const void *key;
 	OtelSpanRef ref;
 	int			subxact_level;
+	bool		detached;		/* a cursor's executor span */
 } StmtSpanEntry;
 
 static StmtSpanEntry stmt_stack[OTEL_STMT_STACK_MAX];
 static int	stmt_stack_depth = 0;
+
+/*
+ * True for the duration of PerformCursorOpen()'s call down from
+ * otel_ProcessUtility(), i.e. exactly while the cursor's own
+ * ExecutorStart runs.  Tells otel_ExecutorStart() to start that one
+ * span .detached (see push_stmt_span()/start_stmt_span()).
+ */
+static bool otel_declaring_cursor_portal = false;
 
 /* Per-backend scratch context for building attribute values (e.g. plan
  * shape digests) that are copied into the span the moment they're set;
@@ -98,10 +115,13 @@ static MemoryContext stmt_attr_cxt = NULL;
 
 /* Hook chains */
 static ExecutorStart_hook_type prev_ExecutorStart_hook = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 
 static void otel_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void otel_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
+							  uint64 count);
 static void otel_ExecutorEnd(QueryDesc *queryDesc);
 static void otel_ProcessUtility(PlannedStmt *pstmt,
 								const char *queryString,
@@ -117,14 +137,15 @@ static void otel_pgtracing_subxact_callback(SubXactEvent event,
 											SubTransactionId parentSubid,
 											void *arg);
 static void otel_proc_exit_cb(int code, Datum arg);
-static void push_stmt_span(const void *key, OtelSpanRef ref);
+static void push_stmt_span(const void *key, OtelSpanRef ref, bool detached);
 static OtelSpanRef pop_stmt_span(const void *key);
+static bool peek_cursor_span(const void *key, OtelSpanRef *ref);
 static void maybe_apply_sqlcommenter(const char *sql);
 static void maybe_reset_comment_context(void);
 static void publish_leader_context(OtelSpanRef s);
 static void restore_leader_context(void);
 static OtelSpanRef start_stmt_span(const char *name, const char *query_text,
-								   uint64 query_id);
+								   uint64 query_id, bool detached);
 static void finalize_stmt_span(OtelSpanRef s);
 
 
@@ -137,6 +158,8 @@ otel_trace_install_hooks(void)
 {
 	prev_ExecutorStart_hook = ExecutorStart_hook;
 	ExecutorStart_hook = otel_ExecutorStart;
+	prev_ExecutorRun_hook = ExecutorRun_hook;
+	ExecutorRun_hook = otel_ExecutorRun;
 	prev_ExecutorEnd_hook = ExecutorEnd_hook;
 	ExecutorEnd_hook = otel_ExecutorEnd;
 
@@ -161,7 +184,7 @@ otel_trace_install_hooks(void)
  * to bound pathological recursion depth, not a normal path.
  */
 static void
-push_stmt_span(const void *key, OtelSpanRef ref)
+push_stmt_span(const void *key, OtelSpanRef ref, bool detached)
 {
 	if (ref.v == 0)
 		return;
@@ -175,6 +198,7 @@ push_stmt_span(const void *key, OtelSpanRef ref)
 	stmt_stack[stmt_stack_depth].key = key;
 	stmt_stack[stmt_stack_depth].ref = ref;
 	stmt_stack[stmt_stack_depth].subxact_level = GetCurrentTransactionNestLevel();
+	stmt_stack[stmt_stack_depth].detached = detached;
 	stmt_stack_depth++;
 }
 
@@ -202,6 +226,29 @@ pop_stmt_span(const void *key)
 		}
 	}
 	return OTEL_SPAN_NONE;
+}
+
+/*
+ * Non-destructive lookup for otel_ExecutorRun(): true and *ref set if
+ * key names a .detached (cursor) entry still on the bookkeeping stack;
+ * false (an ordinary statement, or no entry at all -- e.g. a FETCH's
+ * ExecutorRun when nothing is recording) otherwise.  Does not touch
+ * the entry; it is removed later, at the matching ExecutorEnd.
+ */
+static bool
+peek_cursor_span(const void *key, OtelSpanRef *ref)
+{
+	for (int i = stmt_stack_depth - 1; i >= 0; i--)
+	{
+		if (stmt_stack[i].key == key)
+		{
+			if (!stmt_stack[i].detached)
+				return false;
+			*ref = stmt_stack[i].ref;
+			return true;
+		}
+	}
+	return false;
 }
 
 /*
@@ -292,7 +339,8 @@ restore_leader_context(void)
  * would begin a brand-new (unwanted) root trace.
  */
 static OtelSpanRef
-start_stmt_span(const char *name, const char *query_text, uint64 query_id)
+start_stmt_span(const char *name, const char *query_text, uint64 query_id,
+				bool detached)
 {
 	OtelSpanContext ctx;
 	bool		have_ctx;
@@ -320,12 +368,14 @@ start_stmt_span(const char *name, const char *query_text, uint64 query_id)
 							.kind = OTEL_SPAN_KIND_SERVER,
 							.parent = rc.is_set ? OTEL_PARENT_CONTEXT : OTEL_PARENT_ROOT,
 							.parent_ctx = rc.is_set ? &rc.ctx : NULL,
+							.detached = detached,
 							.force_sample = otel_trace_all_queries);
 	}
 	else
 		s = otel_span_start(.tracer = &otel_pg_tracer,
 							.name = name,
 							.kind = OTEL_SPAN_KIND_SERVER,
+							.detached = detached,
 							.force_sample = otel_trace_all_queries);
 	if (s.v == 0)
 		return s;
@@ -400,6 +450,7 @@ static void
 otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	OtelSpanRef s;
+	bool		is_cursor = otel_declaring_cursor_portal;
 
 	if (queryDesc != NULL)
 		maybe_apply_sqlcommenter(queryDesc->sourceText);
@@ -410,14 +461,22 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * otel_postgres_tracing's design notes: a clear HOOK-based vs.
 	 * INTERCEPTED-tracepoint span-source discriminator is still owed;
 	 * OTEL_PG_SPAN_SOURCE is available for that once adopted here).
+	 *
+	 * A cursor's span (otel_declaring_cursor_portal set by
+	 * otel_ProcessUtility for DECLARE CURSOR) is .detached: it must
+	 * outlive this call, staying open across every FETCH up to CLOSE,
+	 * so it cannot sit on otel_api's active stack the way an ordinary
+	 * statement span does.  otel_ExecutorRun() activates it only for
+	 * the duration of each FETCH's run.
 	 */
 	s = start_stmt_span("pgsql.execute",
 						queryDesc ? queryDesc->sourceText : NULL,
 						queryDesc && queryDesc->plannedstmt
-						? (uint64) queryDesc->plannedstmt->queryId : 0);
+						? (uint64) queryDesc->plannedstmt->queryId : 0,
+						is_cursor);
 
 	if (queryDesc != NULL)
-		push_stmt_span(queryDesc, s);
+		push_stmt_span(queryDesc, s, is_cursor);
 
 	/*
 	 * If any group-A feature is enabled, turn on per-node Instrumentation
@@ -452,6 +511,44 @@ otel_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		otel_planwalk_executor_start(queryDesc, s, stmt_attr_cxt);
 		otel_planshape_executor_start(queryDesc, s, stmt_attr_cxt);
 	}
+}
+
+/*
+ * ExecutorRun hook.  For an ordinary statement, its own executor span
+ * is already current (pushed, non-.detached, by otel_ExecutorStart), so
+ * there is nothing to do here.  For a cursor's portal -- its span is
+ * .detached, so it is NOT on the active stack between DECLARE and
+ * CLOSE -- activate it for just this one FETCH's run, so work done
+ * while materialising rows (e.g. a volatile function called from the
+ * target list) parents to the cursor span instead of whatever
+ * unrelated span happens to be current (e.g. the "FETCH" utility
+ * span, or nothing).  Deactivated in PG_FINALLY so a FETCH that
+ * errors still leaves the active stack clean.
+ */
+static void
+otel_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	OtelSpanRef cursor_span = OTEL_SPAN_NONE;
+	OtelActivation act = OTEL_ACTIVATION_NONE;
+	bool		is_cursor;
+
+	is_cursor = queryDesc != NULL && peek_cursor_span(queryDesc, &cursor_span);
+	if (is_cursor)
+		act = otel_span_activate(cursor_span);
+
+	PG_TRY();
+	{
+		if (prev_ExecutorRun_hook)
+			prev_ExecutorRun_hook(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		if (is_cursor)
+			otel_span_deactivate(act);
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -497,6 +594,9 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	 * address of this frame-local variable. */
 	char		call_token;
 	OtelSpanRef s = OTEL_SPAN_NONE;
+	bool		is_declare_cursor = pstmt->utilityStmt &&
+		IsA(pstmt->utilityStmt, DeclareCursorStmt);
+	bool		save_declaring_cursor_portal = otel_declaring_cursor_portal;
 
 	if (context == PROCESS_UTILITY_TOPLEVEL)
 	{
@@ -508,9 +608,21 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 			? GetCommandTagName(CreateCommandTag(pstmt->utilityStmt))
 			: "pgsql.utility";
 
-		s = start_stmt_span(name, queryString, (uint64) pstmt->queryId);
-		push_stmt_span(&call_token, s);
+		s = start_stmt_span(name, queryString, (uint64) pstmt->queryId, false);
+		push_stmt_span(&call_token, s, false);
 	}
+
+	/*
+	 * otel_ExecutorStart(), called synchronously from
+	 * PerformCursorOpen()'s PortalStart() below, checks this flag to
+	 * start the cursor's own executor span .detached.  Save/restore
+	 * rather than assume it was false: a DECLARE CURSOR whose query
+	 * itself somehow re-enters ProcessUtility (not expected, but this
+	 * keeps a stray error path from leaving the flag stuck on) must not
+	 * clobber an enclosing one.
+	 */
+	if (is_declare_cursor)
+		otel_declaring_cursor_portal = true;
 
 	PG_TRY();
 	{
@@ -525,6 +637,7 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 	}
 	PG_CATCH();
 	{
+		otel_declaring_cursor_portal = save_declaring_cursor_portal;
 		/* Re-throw; the span (if any) is ended, and exported with
 		 * ERROR status, by resource-owner release.  Just keep our
 		 * own bookkeeping consistent. */
@@ -533,6 +646,7 @@ otel_ProcessUtility(PlannedStmt *pstmt,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	otel_declaring_cursor_portal = save_declaring_cursor_portal;
 
 	if (context == PROCESS_UTILITY_TOPLEVEL)
 	{
