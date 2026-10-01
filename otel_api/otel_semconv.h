@@ -63,6 +63,7 @@
 #define OTEL_PG_SESSION_USER			"pg.session.user"
 #define OTEL_PG_APPLICATION_NAME		"pg.application_name"
 #define OTEL_PG_BACKEND_TYPE			"pg.backend_type"
+#define OTEL_PG_DATABASE_OID			"pg.database.oid"
 
 /* Query */
 #define OTEL_PG_QUERY_ID				"pg.query_id"

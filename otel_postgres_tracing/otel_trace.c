@@ -38,7 +38,6 @@
 
 #include "access/parallel.h"
 #include "access/xact.h"
-#include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
@@ -407,13 +406,23 @@ start_stmt_span(const char *name, const char *query_text, uint64 query_id,
 
 	otel_span_set_str(s, OTEL_SC_DB_SYSTEM_NAME, OTEL_SC_DB_SYSTEM_POSTGRESQL);
 
-	if (MyDatabaseId != InvalidOid)
-	{
-		const char *dbname = get_database_name(MyDatabaseId);
+	/*
+	 * Never get_database_name(): it reads the catalog and allocates, and
+	 * this span may be starting outside a valid transaction state (e.g.
+	 * the ROLLBACK/ROLLBACK TO SAVEPOINT that recovers from an error --
+	 * get_database_name() asserts IsTransactionState() and would crash a
+	 * cassert backend there). MyProcPort->database_name is the name the
+	 * client connected with, already verified against pg_database by
+	 * InitPostgres, and costs nothing to read. A backend with no Port
+	 * (e.g. a background worker) has no catalog-free source for the
+	 * name; the attribute is just omitted for it. See the proposed core
+	 * MyDatabaseName global in docs/plans/future-core-improvements.md.
+	 */
+	if (MyProcPort && MyProcPort->database_name)
+		otel_span_set_str(s, OTEL_SC_DB_NAMESPACE, MyProcPort->database_name);
 
-		if (dbname)
-			otel_span_set_str(s, OTEL_SC_DB_NAMESPACE, dbname);
-	}
+	if (OidIsValid(MyDatabaseId))
+		otel_span_set_int(s, OTEL_PG_DATABASE_OID, (int64) MyDatabaseId);
 
 	if (query_text)
 		OTEL_SPAN_SET_STR_IF_RECORDING(s, OTEL_SC_DB_QUERY_TEXT, query_text);
