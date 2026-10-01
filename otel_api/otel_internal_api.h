@@ -21,7 +21,7 @@
 #include "otel_api.h"
 
 #define OTEL_INTERNAL_API_MAJOR		1
-#define OTEL_INTERNAL_API_MINOR		1
+#define OTEL_INTERNAL_API_MINOR		2
 #define OTEL_INTERNAL_API_VERSION	OTEL_MAKE_VERSION(OTEL_INTERNAL_API_MAJOR, \
 													  OTEL_INTERNAL_API_MINOR)
 
@@ -73,6 +73,20 @@ typedef struct OtelApiCounters
 	uint64		activate_not_detached;	/* span isn't .detached */
 	uint64		activate_already_active;	/* span is already on the stack */
 	uint64		deactivate_not_active;	/* token isn't currently active */
+
+	/*
+	 * An activation popped without otel_span_deactivate(): by a LIFO
+	 * unwind passing over it (the span it names is left open, owned
+	 * elsewhere), or by (sub)transaction end.  leaked_at_commit_count
+	 * is the subset popped at top-level COMMIT/PREPARE -- the caller
+	 * forgot to deactivate before committing, same shape as a leaked
+	 * span, but the activation itself is not ended.  Popped at ABORT
+	 * (top-level or subtransaction) is ordinary cleanup and not
+	 * counted as a leak, only in activation_unwound if that also
+	 * happened to be via an unwind.
+	 */
+	uint64		activation_unwound;
+	uint64		activation_leaked_at_commit;
 } OtelApiCounters;
 
 typedef struct OtelInternalApi

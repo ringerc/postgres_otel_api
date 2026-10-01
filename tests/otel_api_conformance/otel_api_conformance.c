@@ -818,6 +818,8 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"activate_not_detached\":" UINT64_FORMAT ","
 					  "\"activate_already_active\":" UINT64_FORMAT ","
 					  "\"deactivate_not_active\":" UINT64_FORMAT ","
+					  "\"activation_unwound\":" UINT64_FORMAT ","
+					  "\"activation_leaked_at_commit\":" UINT64_FORMAT ","
 					  "\"conformance_sampler_calls\":" INT64_FORMAT ","
 					  "\"conformance_side_effect_calls\":" INT64_FORMAT ","
 					  "\"conformance_captured\":%d"
@@ -831,6 +833,7 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  c.error_capture_failed, c.emit_hook_errors,
 					  c.activate_not_detached, c.activate_already_active,
 					  c.deactivate_not_active,
+					  c.activation_unwound, c.activation_leaked_at_commit,
 					  conformance_sampler_calls, conformance_side_effect_calls,
 					  n_captured);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));

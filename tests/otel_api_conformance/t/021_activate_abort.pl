@@ -123,7 +123,7 @@ SQL
 
 	my @followup = parse_spans($lines[2]);
 	is(scalar(@followup), 1, 'top-level abort: the follow-up span was captured');
-	is($followup[0]->{parent_span_id}, '',
+	is($followup[0]->{parent_span_id}, '0000000000000000',
 		'top-level abort: the follow-up span does NOT parent to the leaked activation'
 	) if @followup;
 }
@@ -165,7 +165,7 @@ SQL
 	my @followup = parse_spans($lines[2]);
 	is(scalar(@followup), 1,
 		'subxact abort: the follow-up span was captured');
-	is($followup[0]->{parent_span_id}, '',
+	is($followup[0]->{parent_span_id}, '0000000000000000',
 		'subxact abort: the follow-up span does NOT parent to the leaked activation')
 	  if @followup;
 }

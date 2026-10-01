@@ -131,8 +131,25 @@ typedef struct OtelNrec
 
 /*
  * The active stack.  Entry >= 0 is a slot index; < 0 is -(nrec index) - 1.
+ *
+ * span_stack_meta runs parallel to span_stack: an entry pushed by
+ * otel_span_activate() (rather than otel_span_start()) is marked
+ * is_activation, with the subtransaction nest level current at
+ * activation time.  That is what tells apart a span's own stack entry
+ * (ended, not merely popped, by otel_span_end()/abort/unwind) from an
+ * activation of a .detached span the caller still owns elsewhere
+ * (popped only -- never ended -- by otel_span_deactivate(), by a
+ * (sub)transaction ending at or above that level, or by a LIFO unwind
+ * passing over it).
  */
+typedef struct StackEntryMeta
+{
+	bool		is_activation;
+	int			nest_level;		/* subxact level when activated */
+} StackEntryMeta;
+
 static int32 span_stack[OTEL_MAX_STACK_DEPTH];
+static StackEntryMeta span_stack_meta[OTEL_MAX_STACK_DEPTH];
 static int	span_stack_depth = 0;
 
 static OtelSlot *slots = NULL;
@@ -446,6 +463,16 @@ stack_find(int32 entry)
 	return -1;
 }
 
+/* Push entry, recording whether it is an activation (see StackEntryMeta). */
+static inline void
+stack_push(int32 entry, bool is_activation, int nest_level)
+{
+	span_stack[span_stack_depth] = entry;
+	span_stack_meta[span_stack_depth].is_activation = is_activation;
+	span_stack_meta[span_stack_depth].nest_level = nest_level;
+	span_stack_depth++;
+}
+
 /* Remove the entry at position pos, closing the gap. */
 static void
 stack_remove_at(int pos)
@@ -453,6 +480,8 @@ stack_remove_at(int pos)
 	Assert(pos >= 0 && pos < span_stack_depth);
 	memmove(&span_stack[pos], &span_stack[pos + 1],
 			(span_stack_depth - pos - 1) * sizeof(span_stack[0]));
+	memmove(&span_stack_meta[pos], &span_stack_meta[pos + 1],
+			(span_stack_depth - pos - 1) * sizeof(span_stack_meta[0]));
 	span_stack_depth--;
 }
 
@@ -478,8 +507,21 @@ stack_unwind_above(int pos, const char *reason)
 	while (span_stack_depth > pos + 1)
 	{
 		int32		e = span_stack[span_stack_depth - 1];
+		bool		is_activation = span_stack_meta[span_stack_depth - 1].is_activation;
 
 		span_stack_depth--;
+		if (is_activation)
+		{
+			/*
+			 * An activation names a .detached span some other
+			 * component still owns (e.g. a cursor's executor span).
+			 * Unwinding past it must only pop it off the active
+			 * stack, never end the span itself -- that would end a
+			 * span out from under its real owner.
+			 */
+			otel_counters.activation_unwound++;
+			continue;
+		}
 		if (e >= 0)
 			end_slot(e, 0, true, reason);
 		else
@@ -1055,6 +1097,33 @@ drop_nrecs_from_level(int level)
 			free_nrec(i, true);
 }
 
+/*
+ * Pop (never end) activation entries made at subtransaction level >=
+ * level.  Nothing else tears an activation down: the span it names
+ * has its own, independent lifecycle (owned by a resource owner, or a
+ * session/nrec that outlives the transaction), so otel_api must stop
+ * treating it as current without touching that lifecycle at all.
+ *
+ * is_leak counts each one in activation_leaked_at_commit: at a
+ * top-level COMMIT/PREPARE, a remaining activation means the caller
+ * never deactivated it, same shape as a leaked span.  At ABORT (top-
+ * level or subtransaction) this is ordinary unwind-time cleanup, not a
+ * caller mistake, so it isn't counted here.
+ */
+static void
+drop_activations_from_level(int level, bool is_leak)
+{
+	for (int i = span_stack_depth - 1; i >= 0; i--)
+	{
+		if (span_stack_meta[i].is_activation && span_stack_meta[i].nest_level >= level)
+		{
+			if (is_leak)
+				otel_counters.activation_leaked_at_commit++;
+			stack_remove_at(i);
+		}
+	}
+}
+
 static void
 otel_xact_callback(XactEvent event, void *arg)
 {
@@ -1062,10 +1131,14 @@ otel_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_PREPARE:
 			drop_nrecs_from_level(1);
+			drop_activations_from_level(1, true);
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			drop_nrecs_from_level(1);
+			drop_activations_from_level(1, false);
 			break;
 		default:
 			break;
@@ -1077,7 +1150,12 @@ otel_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					  SubTransactionId parentSubid, void *arg)
 {
 	if (event == SUBXACT_EVENT_ABORT_SUB)
-		drop_nrecs_from_level(GetCurrentTransactionNestLevel());
+	{
+		int			level = GetCurrentTransactionNestLevel();
+
+		drop_nrecs_from_level(level);
+		drop_activations_from_level(level, false);
+	}
 }
 
 static void
@@ -1143,7 +1221,7 @@ start_nrec(const OtelSpanStartArgs *args, const ResolvedParent *p,
 	(void) p;
 
 	if (!args->detached)
-		span_stack[span_stack_depth++] = stack_entry_for_nrec(idx);
+		stack_push(stack_entry_for_nrec(idx), false, 0);
 	otel_counters.spans_unsampled++;
 	return make_ref(n->gen, idx, false);
 }
@@ -1345,7 +1423,7 @@ api_span_start(const OtelSpanStartArgs *args)
 
 	ref = make_ref(slot->gen, idx, true);
 	if (!args->detached)
-		span_stack[span_stack_depth++] = stack_entry_for_slot(idx);
+		stack_push(stack_entry_for_slot(idx), false, 0);
 	if (owner != NULL)
 		ResourceOwnerRemember(owner, Int64GetDatum(ref.v), &otel_span_resowner_desc);
 	else
@@ -1890,7 +1968,7 @@ api_span_activate(OtelSpanRef s)
 		return OTEL_ACTIVATION_NONE;
 	}
 
-	span_stack[span_stack_depth++] = entry;
+	stack_push(entry, true, GetCurrentTransactionNestLevel());
 	return (OtelActivation) {make_ref(gen, idx, recording).v};
 }
 
@@ -2097,6 +2175,7 @@ otel_api_counters(PG_FUNCTION_ARGS)
 		F(attr_truncated), F(attr_dropped), F(event_dropped), F(link_dropped),
 		F(error_capture_failed), F(emit_hook_errors),
 		F(activate_not_detached), F(activate_already_active), F(deactivate_not_active),
+		F(activation_unwound), F(activation_leaked_at_commit),
 #undef F
 	};
 
