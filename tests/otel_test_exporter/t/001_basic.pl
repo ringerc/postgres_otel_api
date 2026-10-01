@@ -382,12 +382,18 @@ is(first_value(@msgs), '0',
 # only forces recording for a brand-new root span (no parent context at
 # all).  Recording a child under a parent that is never exported would
 # produce an orphan span (postgres-cdq.19).
+#
+# The M-header's context is statement-scoped --- it is cleared at the
+# ReadyForQuery boundary that follows each separate Query message
+# (otel_trace_context_clear_cb) --- so SET/SELECT/RESET must all ride
+# the SAME simple-Query message (one semicolon-separated batch, one
+# ReadyForQuery) to keep the remote parent context live across them.
 run_query($sock, 'SELECT test_otel_clear()');
 send_msg($sock, 'M',
 	headers_body('otel.traceparent' => $UNSAMPLED_TRACEPARENT));
-run_query($sock, 'SET otel.trace_all_queries = on');
-run_query($sock, 'SELECT 1');
-run_query($sock, 'RESET otel.trace_all_queries');
+run_query($sock,
+	'SET otel.trace_all_queries = on; SELECT 1; RESET otel.trace_all_queries;'
+);
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
 is(first_value(@msgs), '0',
@@ -399,9 +405,9 @@ is(first_value(@msgs), '0',
 run_query($sock, 'SELECT test_otel_clear()');
 send_msg($sock, 'M',
 	headers_body('otel.traceparent' => $TRACEPARENT));
-run_query($sock, 'SET otel.trace_all_queries = on');
-run_query($sock, 'SELECT 1');
-run_query($sock, 'RESET otel.trace_all_queries');
+run_query($sock,
+	'SET otel.trace_all_queries = on; SELECT 1; RESET otel.trace_all_queries;'
+);
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
 isnt(first_value(@msgs), '0',
