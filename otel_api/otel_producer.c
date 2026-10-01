@@ -1295,16 +1295,15 @@ api_span_start(const OtelSpanStartArgs *args)
 				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_RECORD_ONLY;
 			break;
 		case PARENT_NREC:
-			if (!args->force_sample)
-				return start_nrec(args, &p, &nrecs[p.idx].ctx.trace_id,
-								  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
-			/* Forced: a recording child of the unsampled span's context. */
-			nrec_context(&nrecs[p.idx], &p.ctx);
-			p.kind = PARENT_REMOTE;
-			trace_id = p.ctx.trace_id;
-			parent_flags = p.ctx.trace_flags;
-			decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			break;
+			/*
+			 * An unsampled local parent.  force_sample does not apply
+			 * here: it only forces a new root to record (PARENT_NONE,
+			 * below), never a child of an unsampled parent --- that
+			 * would record a span whose parent is never exported,
+			 * producing an orphan.
+			 */
+			return start_nrec(args, &p, &nrecs[p.idx].ctx.trace_id,
+							  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
 		case PARENT_REMOTE:
 			{
 				OtelSamplerInput in = {
@@ -1328,12 +1327,22 @@ api_span_start(const OtelSpanStartArgs *args)
 				new_trace_id(&trace_id);
 				parent_flags = OTEL_TRACE_FLAG_RANDOM;
 				decision = otel_run_sampler(&in, false);
+				/*
+				 * force_sample applies only to a new root: an explicit
+				 * per-session opt-in ("trace everything") bypasses the
+				 * sampler hook for spans that start their own trace.  It
+				 * must never override the decision for a span with a
+				 * parent (PARENT_SLOT/PARENT_NREC/PARENT_REMOTE above) ---
+				 * doing so would record a span under an unrecorded
+				 * parent, and that parent is never exported, producing an
+				 * orphan span.
+				 */
+				if (args->force_sample)
+					decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
 				break;
 			}
 	}
 
-	if (args->force_sample)
-		decision = OTEL_SAMPLE_RECORD_AND_SAMPLE;
 	if (decision == OTEL_SAMPLE_DROP)
 		return start_nrec(args, &p, &trace_id, parent_flags & OTEL_TRACE_FLAG_RANDOM);
 

@@ -192,10 +192,17 @@ typedef struct OtelSpanStartArgs
 	TimestampTz start_time;
 
 	/*
-	 * Record the span even if sampling would drop it (an unsampled parent,
-	 * or the sampler hook).  For operator settings that ask to trace
-	 * everything, such as otel.trace_all_queries.  The span is exported
-	 * with sampled=1, and its children inherit that as usual.
+	 * Record the span even if the sampler hook would drop it ---
+	 * but only when the span starts a new root trace (no parent
+	 * context at all).  For operator settings that ask to trace
+	 * everything with no client-supplied context, such as
+	 * otel.trace_all_queries.  Has no effect when the span has a
+	 * parent (an active local span, recording or not, or a remote
+	 * context): the span then always follows the parent's sampling
+	 * decision, sampled or not.  Forcing a child to record under an
+	 * unrecorded parent would produce an orphan span, since the
+	 * parent is never exported.  The span is exported with
+	 * sampled=1, and its children inherit that as usual.
 	 */
 	bool		force_sample;
 } OtelSpanStartArgs;
