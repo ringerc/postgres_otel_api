@@ -223,6 +223,25 @@ int			otel_max_session_spans = 16;
 int			otel_attr_value_max = 4096;
 int			otel_max_span_bytes = 65536;
 
+/*
+ * otel_api's sampler policy.  Consulted by otel_run_sampler()
+ * (otel_api.c) only for a brand-new root span or a remote parent ---
+ * every other span simply inherits its local parent's decision.  See
+ * OtelApiSampler for the OTEL_TRACES_SAMPLER-style values.
+ */
+int			otel_sampler_mode = OTEL_SAMPLER_PARENTBASED_ALWAYS_ON;
+double		otel_sampler_arg = 1.0;
+
+static const struct config_enum_entry otel_sampler_options[] = {
+	{"always_on", OTEL_SAMPLER_ALWAYS_ON, false},
+	{"always_off", OTEL_SAMPLER_ALWAYS_OFF, false},
+	{"traceidratio", OTEL_SAMPLER_TRACEIDRATIO, false},
+	{"parentbased_always_on", OTEL_SAMPLER_PARENTBASED_ALWAYS_ON, false},
+	{"parentbased_always_off", OTEL_SAMPLER_PARENTBASED_ALWAYS_OFF, false},
+	{"parentbased_traceidratio", OTEL_SAMPLER_PARENTBASED_TRACEIDRATIO, false},
+	{NULL, 0, false},
+};
+
 
 static void assign_emit_spans_to_log(bool newval, void *extra);
 
@@ -464,6 +483,33 @@ _PG_init(void)
 							PGC_SUSET,
 							GUC_UNIT_BYTE,
 							NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("otel_api.sampler",
+							 "The sampler otel_api uses for a new root span or a remote parent.",
+							 "Standard OTEL_TRACES_SAMPLER names.  parentbased_* variants use the "
+							 "remote parent's W3C sampled bit when there is one, and fall back to "
+							 "the non-parentbased behaviour of the same name for a brand-new root. "
+							 "A local parent's own decision is always inherited regardless of this "
+							 "setting.  Raising the sample rate cluster-wide is an operator decision "
+							 "(PGC_SUSET); see otel.trace_all_queries for the per-session opt-in that "
+							 "starts new root traces at all.",
+							 &otel_sampler_mode,
+							 OTEL_SAMPLER_PARENTBASED_ALWAYS_ON,
+							 otel_sampler_options,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("otel_api.sampler_arg",
+							 "Sampling probability for the traceidratio and parentbased_traceidratio samplers.",
+							 "Ignored by the other sampler values.  OTel consistent probability "
+							 "sampling on the trace ID's low 56 bits: 1.0 always samples, 0.0 never "
+							 "does.",
+							 &otel_sampler_arg,
+							 1.0, 0.0, 1.0,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	/* trace_all_queries is owned by otel_postgres_tracing; see its
 	 * _PG_init for that GUC. */

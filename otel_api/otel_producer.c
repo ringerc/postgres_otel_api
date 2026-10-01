@@ -1306,31 +1306,22 @@ api_span_start(const OtelSpanStartArgs *args)
 							  nrecs[p.idx].ctx.trace_flags & OTEL_TRACE_FLAG_RANDOM);
 		case PARENT_REMOTE:
 			{
-				OtelSamplerInput in = {
-					.trace_id = &p.ctx.trace_id, .parent = &p.ctx,
-					.name = args->name, .kind = args->kind,
-				};
-
 				trace_id = p.ctx.trace_id;
 				parent_flags = p.ctx.trace_flags;
-				decision = otel_run_sampler(&in, otel_span_context_sampled(&p.ctx));
+				decision = otel_run_sampler(&trace_id, false,
+											otel_span_context_sampled(&p.ctx));
 				break;
 			}
 		case PARENT_NONE:
 		default:
 			{
-				OtelSamplerInput in = {
-					.trace_id = &trace_id, .parent = NULL,
-					.name = args->name, .kind = args->kind,
-				};
-
 				new_trace_id(&trace_id);
 				parent_flags = OTEL_TRACE_FLAG_RANDOM;
-				decision = otel_run_sampler(&in, false);
+				decision = otel_run_sampler(&trace_id, true, false);
 				/*
 				 * force_sample applies only to a new root: an explicit
 				 * per-session opt-in ("trace everything") bypasses the
-				 * sampler hook for spans that start their own trace.  It
+				 * sampler for spans that start their own trace.  It
 				 * must never override the decision for a span with a
 				 * parent (PARENT_SLOT/PARENT_NREC/PARENT_REMOTE above) ---
 				 * doing so would record a span under an unrecorded

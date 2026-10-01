@@ -192,7 +192,7 @@ typedef struct OtelSpanStartArgs
 	TimestampTz start_time;
 
 	/*
-	 * Record the span even if the sampler hook would drop it ---
+	 * Record the span even if otel_api.sampler would drop it ---
 	 * but only when the span starts a new root trace (no parent
 	 * context at all).  For operator settings that ask to trace
 	 * everything with no client-supplied context, such as

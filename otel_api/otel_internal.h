@@ -15,6 +15,23 @@
 
 #include "otel.h"
 
+/*
+ * otel_api's own sampler policy: the OTEL_TRACES_SAMPLER names, plus
+ * the ratio argument for the two ratio-based samplers.  Not part of
+ * any audience's API table --- otel_api.sampler / otel_api.sampler_arg
+ * are ordinary GUCs, defined in otel.c and consumed only by
+ * otel_run_sampler() in otel_api.c.
+ */
+typedef enum OtelApiSampler
+{
+	OTEL_SAMPLER_ALWAYS_ON = 0,
+	OTEL_SAMPLER_ALWAYS_OFF,
+	OTEL_SAMPLER_TRACEIDRATIO,
+	OTEL_SAMPLER_PARENTBASED_ALWAYS_ON,
+	OTEL_SAMPLER_PARENTBASED_ALWAYS_OFF,
+	OTEL_SAMPLER_PARENTBASED_TRACEIDRATIO,
+} OtelApiSampler;
+
 /* otel.c: GUCs */
 extern char *otel_tracestate_guc;
 extern bool otel_emit_spans_to_log;
@@ -25,6 +42,8 @@ extern int	otel_attr_value_max;
 extern int	otel_max_span_bytes;
 extern char *otel_service_name_guc;
 extern char *otel_service_instance_id_guc;
+extern int	otel_sampler_mode;		/* OtelApiSampler */
+extern double otel_sampler_arg;
 
 /* otel.c: the backend's root trace context */
 extern OtelRootContext otel_root_ctx;
@@ -34,8 +53,8 @@ extern bool otel_try_apply_sqlcommenter_context(const char *sql);
 /* otel_api.c: hooks and the published tables */
 extern void otel_api_publish_rendezvous(void);
 extern otel_span_emit_hook_type otel_get_span_emit_hook(void);
-extern OtelSamplerDecision otel_run_sampler(const OtelSamplerInput *in,
-											bool remote_sampled);
+extern OtelSamplerDecision otel_run_sampler(const OtelTraceId *trace_id,
+											bool new_root, bool remote_sampled);
 extern bool otel_recording_possible;
 extern void otel_update_recording_possible(void);
 

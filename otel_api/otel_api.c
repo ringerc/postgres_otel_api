@@ -17,6 +17,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "fmgr.h"
 
 #include "otel_internal.h"
@@ -26,9 +28,6 @@
 #endif
 
 static otel_span_emit_hook_type otel_span_emit_hook = NULL;
-static otel_sampler_hook_type otel_sampler_hook = NULL;
-static OtelSamplerHookPolicy otel_sampler_hook_policy =
-	OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT;
 
 /*
  * True when a finished span has somewhere to go: an emit hook, or log
@@ -54,21 +53,6 @@ api_register_emit_hook(otel_span_emit_hook_type new_hook,
 	otel_update_recording_possible();
 }
 
-static void
-api_register_sampler_hook(otel_sampler_hook_type new_hook,
-						  otel_sampler_hook_type *prev_out)
-{
-	if (prev_out)
-		*prev_out = otel_sampler_hook;
-	otel_sampler_hook = new_hook;
-}
-
-static void
-api_set_sampler_policy(OtelSamplerHookPolicy policy)
-{
-	otel_sampler_hook_policy = policy;
-}
-
 otel_span_emit_hook_type
 otel_get_span_emit_hook(void)
 {
@@ -76,35 +60,70 @@ otel_get_span_emit_hook(void)
 }
 
 /*
- * The sampling decision for a span with no local parent to inherit from:
- * a new trace (in->parent == NULL), or a remote parent whose sampled bit
- * is remote_sampled.  See OtelSamplerHookPolicy.
+ * OTel consistent probability sampling (W3C Trace Context level 2):
+ * randomness R is the trace ID's low 56 bits (the last 7 bytes, taken
+ * as a big-endian uint56); the rejection threshold T is
+ * round((1 - ratio) * 2^56).  Sample iff R >= T.  ratio <= 0 always
+ * rejects; ratio >= 1 always samples (T == 0, and R >= 0 always holds).
+ */
+static bool
+otel_traceidratio_sample(const OtelTraceId *trace_id, double ratio)
+{
+	uint64		r = 0;
+	uint64		threshold;
+
+	if (ratio >= 1.0)
+		return true;
+	if (ratio <= 0.0)
+		return false;
+
+	for (int i = OTEL_TRACE_ID_BYTES - 7; i < OTEL_TRACE_ID_BYTES; i++)
+		r = (r << 8) | trace_id->b[i];
+
+	/* 2^56, as a double; round-half-to-even is fine here. */
+	threshold = (uint64) rint((1.0 - ratio) * 72057594037927936.0);
+	return r >= threshold;
+}
+
+/*
+ * otel_api's own sampling policy (otel_api.sampler / otel_api.sampler_arg).
+ * Called only where otel_producer.c has no local parent to inherit a
+ * decision from: a brand-new root (new_root = true, remote_sampled
+ * ignored) or a remote parent (new_root = false, remote_sampled is that
+ * parent's W3C sampled bit).  trace_id is the span's own trace ID (the
+ * freshly generated one for a new root, or the remote parent's for a
+ * remote parent) --- the only input traceidratio needs.
  */
 OtelSamplerDecision
-otel_run_sampler(const OtelSamplerInput *in, bool remote_sampled)
+otel_run_sampler(const OtelTraceId *trace_id, bool new_root, bool remote_sampled)
 {
-	bool		new_trace = in->parent == NULL;
-
-	switch (otel_sampler_hook_policy)
+	switch (otel_sampler_mode)
 	{
-		case OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE:
+		case OTEL_SAMPLER_ALWAYS_ON:
 			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-		case OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT:
-			return (new_trace || remote_sampled)
+		case OTEL_SAMPLER_ALWAYS_OFF:
+			return OTEL_SAMPLE_DROP;
+		case OTEL_SAMPLER_TRACEIDRATIO:
+			return otel_traceidratio_sample(trace_id, otel_sampler_arg)
 				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
-		case OTEL_SAMPLER_HOOK_ALWAYS:
-			break;
-		case OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT:
-		default:
-			if (!new_trace && remote_sampled)
-				return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-			if (!new_trace && otel_sampler_hook == NULL)
-				return OTEL_SAMPLE_DROP;
-			break;
+		case OTEL_SAMPLER_PARENTBASED_ALWAYS_ON:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return OTEL_SAMPLE_RECORD_AND_SAMPLE;
+		case OTEL_SAMPLER_PARENTBASED_ALWAYS_OFF:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return OTEL_SAMPLE_DROP;
+		case OTEL_SAMPLER_PARENTBASED_TRACEIDRATIO:
+			if (!new_root)
+				return remote_sampled
+					? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
+			return otel_traceidratio_sample(trace_id, otel_sampler_arg)
+				? OTEL_SAMPLE_RECORD_AND_SAMPLE : OTEL_SAMPLE_DROP;
 	}
-	if (otel_sampler_hook == NULL)
-		return OTEL_SAMPLE_RECORD_AND_SAMPLE;
-	return otel_sampler_hook(in);
+	return OTEL_SAMPLE_RECORD_AND_SAMPLE;	/* unreachable */
 }
 
 static void
@@ -155,8 +174,6 @@ static const OtelExporterApi otel_exporter_api_table = {
 	.version = OTEL_EXPORTER_API_VERSION,
 	.struct_size = sizeof(OtelExporterApi),
 	.register_emit_hook = api_register_emit_hook,
-	.register_sampler_hook = api_register_sampler_hook,
-	.set_sampler_policy = api_set_sampler_policy,
 	.get_resource_attributes = otel_resource_attrs_get,
 };
 
@@ -199,8 +216,6 @@ otel_api_publish_rendezvous(void)
 	{
 		if (req->emit_hook)
 			api_register_emit_hook(req->emit_hook, req->emit_prev_out);
-		if (req->sampler_hook)
-			api_register_sampler_hook(req->sampler_hook, req->sampler_prev_out);
 	}
 
 #ifdef PG_HAVE_XACT_TRACE_CONTEXT

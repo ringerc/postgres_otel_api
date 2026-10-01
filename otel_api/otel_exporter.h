@@ -3,9 +3,13 @@
  * otel_exporter.h
  *	  The exporter API: for extensions that receive finished spans.
  *
- * An exporter registers an emit hook, and optionally a sampler hook,
- * from _PG_init with otel_exporter_register_when_ready().  It works
- * whichever of otel_api and the exporter loads first.
+ * An exporter registers an emit hook from _PG_init with
+ * otel_exporter_register_when_ready().  It works whichever of otel_api
+ * and the exporter loads first.
+ *
+ * Sampling is otel_api's own policy (otel_api.sampler /
+ * otel_api.sampler_arg), not something an exporter plugs in; there is
+ * no sampler hook here.
  *
  * The emit hook receives a const OtelSpan *.  The span, and every pointer
  * reachable from it, is owned by otel_api and valid only during the
@@ -37,7 +41,13 @@
 #define OTEL_EXPORTER_API_VERSION	OTEL_MAKE_VERSION(OTEL_EXPORTER_API_MAJOR, \
 													  OTEL_EXPORTER_API_MINOR)
 
-/* Mirrors the OTel SDK SamplingDecision. */
+/*
+ * Mirrors the OTel SDK SamplingDecision.  Kept here (rather than made
+ * fully internal) because OtelSpan.sampler_decision, below, is part of
+ * what an exporter sees for every emitted span.  otel_api is the only
+ * thing that produces a value of this type; there is no sampler hook
+ * for an exporter to implement.
+ */
 typedef enum OtelSamplerDecision
 {
 	OTEL_SAMPLE_DROP = 0,
@@ -109,50 +119,7 @@ otel_exporter_span_ok(const OtelSpan *span)
 	return span->struct_size >= sizeof(OtelSpan);
 }
 
-/*
- * Input to the sampler hook, for a span with no recording or unsampled
- * parent to inherit from.  All pointers are valid only during the call.
- * The hook must be fast and should not allocate.
- */
-typedef struct OtelSamplerInput
-{
-	const OtelTraceId *trace_id;	/* the new span's trace ID */
-	const OtelSpanContext *parent;	/* remote parent, or NULL for a new trace */
-	const char *name;
-	OtelSpanKind kind;
-} OtelSamplerInput;
-
-typedef OtelSamplerDecision (*otel_sampler_hook_type) (const OtelSamplerInput *in);
 typedef void (*otel_span_emit_hook_type) (const OtelSpan *span);
-
-/*
- * When the sampler hook is consulted.  "Remote parent" is a context from
- * outside this backend: the 'M' header, otel_api.traceparent,
- * sqlcommenter, a parallel leader, or OTEL_PARENT_CONTEXT.  A child of a
- * span in this backend always inherits its parent's decision.
- *
- * With no hook registered, a new trace is recorded, as with the OTel SDK
- * default sampler (ParentBased(AlwaysOn)).  A producer that shouldn't
- * start traces on its own (e.g. query tracing without trace context)
- * checks otel_span_context_of(OTEL_SPAN_NONE, ...) before starting.
- *
- *	 ON_UNSAMPLED_BIT (default): W3C ParentBased.  A remote parent with
- *		sampled=1 is recorded without asking.  A remote parent with
- *		sampled=0 goes to the hook (no hook: not recorded).  A new trace
- *		goes to the hook (no hook: recorded).
- *	 ALWAYS: the hook decides for every remote parent and every new trace
- *		(no hook: recorded).
- *	 NEVER_RESPECT_BIT: no hook; a remote parent's sampled bit decides,
- *		and a new trace is recorded.
- *	 NEVER_ALWAYS_SAMPLE: no hook; everything is recorded.
- */
-typedef enum OtelSamplerHookPolicy
-{
-	OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT = 0,
-	OTEL_SAMPLER_HOOK_ALWAYS = 1,
-	OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT = 2,
-	OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE = 3,
-} OtelSamplerHookPolicy;
 
 typedef struct OtelResourceAttribute
 {
@@ -166,14 +133,11 @@ typedef struct OtelExporterApi
 	uint32		struct_size;	/* sizeof(OtelExporterApi) */
 
 	/*
-	 * Chainable hooks.  *prev_out receives the previous hook, which the
-	 * new hook must call.  Call from _PG_init only.
+	 * Chainable emit hook.  *prev_out receives the previous hook, which
+	 * the new hook must call.  Call from _PG_init only.
 	 */
 	void		(*register_emit_hook) (otel_span_emit_hook_type new_hook,
 									   otel_span_emit_hook_type *prev_out);
-	void		(*register_sampler_hook) (otel_sampler_hook_type new_hook,
-										  otel_sampler_hook_type *prev_out);
-	void		(*set_sampler_policy) (OtelSamplerHookPolicy policy);
 
 	/*
 	 * The process Resource.  The array and strings are owned by otel_api
@@ -221,8 +185,6 @@ typedef struct OtelPendingRegistration
 {
 	otel_span_emit_hook_type emit_hook;
 	otel_span_emit_hook_type *emit_prev_out;
-	otel_sampler_hook_type sampler_hook;
-	otel_sampler_hook_type *sampler_prev_out;
 	struct OtelPendingRegistration *next;
 } OtelPendingRegistration;
 
@@ -250,8 +212,6 @@ otel_exporter_register_when_ready(OtelPendingRegistration *req)
 			return;
 		if (req->emit_hook)
 			e->register_emit_hook(req->emit_hook, req->emit_prev_out);
-		if (req->sampler_hook)
-			e->register_sampler_hook(req->sampler_hook, req->sampler_prev_out);
 		return;
 	}
 	{
