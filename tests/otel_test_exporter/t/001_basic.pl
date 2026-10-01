@@ -378,8 +378,10 @@ run_query($sock, 'SELECT 1');
 is(first_value(@msgs), '0',
 	'no span emitted for an upstream-unsampled traceparent (default policy)');
 
-# But trace_all_queries still wins over the unsampled bit --- the
-# force-on path bypasses propagated sampling state entirely.
+# trace_all_queries must NOT override an unsampled remote parent: it
+# only forces recording for a brand-new root span (no parent context at
+# all).  Recording a child under a parent that is never exported would
+# produce an orphan span (postgres-cdq.19).
 run_query($sock, 'SELECT test_otel_clear()');
 send_msg($sock, 'M',
 	headers_body('otel.traceparent' => $UNSAMPLED_TRACEPARENT));
@@ -388,8 +390,22 @@ run_query($sock, 'SELECT 1');
 run_query($sock, 'RESET otel.trace_all_queries');
 
 @msgs = run_query($sock, 'SELECT test_otel_span_count()');
+is(first_value(@msgs), '0',
+	'trace_all_queries does not override an unsampled remote parent');
+
+# ... but a SAMPLED remote parent still gets a recorded child under
+# trace_all_queries, same as without the GUC (it follows the parent's
+# own sampling decision; force_sample just didn't need to do anything).
+run_query($sock, 'SELECT test_otel_clear()');
+send_msg($sock, 'M',
+	headers_body('otel.traceparent' => $TRACEPARENT));
+run_query($sock, 'SET otel.trace_all_queries = on');
+run_query($sock, 'SELECT 1');
+run_query($sock, 'RESET otel.trace_all_queries');
+
+@msgs = run_query($sock, 'SELECT test_otel_span_count()');
 isnt(first_value(@msgs), '0',
-	'trace_all_queries overrides unsampled traceparent');
+	'trace_all_queries still records a child of a sampled remote parent');
 
 # ----------------------------------------------------------------------
 # Tidy up.

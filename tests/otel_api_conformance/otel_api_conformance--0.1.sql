@@ -40,7 +40,8 @@ CREATE FUNCTION otel_api_conformance_start(
 	owner_mode text DEFAULT 'default',
 	owner_id bigint DEFAULT NULL,
 	detached boolean DEFAULT false,
-	scoped boolean DEFAULT false
+	scoped boolean DEFAULT false,
+	force_sample boolean DEFAULT false
 ) RETURNS bigint
 AS 'MODULE_PATHNAME', 'otel_api_conformance_start'
 LANGUAGE C VOLATILE;

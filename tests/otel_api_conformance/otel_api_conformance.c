@@ -866,6 +866,7 @@ otel_api_conformance_start(PG_FUNCTION_ARGS)
 	int64		owner_id = have_owner_id ? PG_GETARG_INT64(7) : 0;
 	bool		detached = PG_ARGISNULL(8) ? false : PG_GETARG_BOOL(8);
 	bool		scoped = PG_ARGISNULL(9) ? false : PG_GETARG_BOOL(9);
+	bool		force_sample = PG_ARGISNULL(10) ? false : PG_GETARG_BOOL(10);
 
 	OtelTracer *tracer = (strcmp(producer, "b") == 0) ? &tracer_b : &tracer_a;
 	OtelSpanKind kind = kind_from_text(kind_s);
@@ -893,7 +894,8 @@ otel_api_conformance_start(PG_FUNCTION_ARGS)
 						 .parent_span = parent_span,
 						 .owner = owner,
 						 .detached = detached,
-						 .scoped = scoped);
+						 .scoped = scoped,
+						 .force_sample = force_sample);
 	PG_RETURN_INT64(s.v);
 }
 
