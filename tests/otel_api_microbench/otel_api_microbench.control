@@ -1,0 +1,4 @@
+comment = 'throwaway microbenchmark: otel_api producer API cost (not for install)'
+default_version = '0.1'
+module_pathname = '$libdir/otel_api_microbench'
+relocatable = true
