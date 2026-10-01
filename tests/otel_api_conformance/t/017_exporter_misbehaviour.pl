@@ -455,9 +455,24 @@ sub run_fatal_scenario
 		# Let the remaining scenarios run against a restarted server.
 		wait_for_restart()
 		  or BAIL_OUT("server did not come back up after the induced crash");
-		return;
+		return $log;
 	}
 	$survivor->quit;
+	return $log;
+}
+
+# Count how many times a span named $name was dispatched, from the
+# server log.  A sibling that isn't the misbehaving span dispatches
+# normally (dispatch_span()'s own "otel-span: ..." log line, emitted
+# after the emit hook returns, since otel_api.emit_spans_to_log is on
+# throughout this file), so this works for any non-FATAL span whether
+# it was released in the first (aborted-by-the-FATAL) resource-owner
+# pass or the second one that backend exit (AbortOutOfAnyTransaction)
+# drives.
+sub count_dispatches
+{
+	my ($log, $name) = @_;
+	return () = $log =~ /"name":"\Q$name\E"/g;
 }
 
 run_fatal_scenario('C1 fatal/normal-path', 'conformance.c1', <<'SQL');
@@ -467,14 +482,29 @@ SQL
 
 # C2: abort path -- the span is owned by TopTransactionResourceOwner and
 # released (unwound) by ROLLBACK's abort processing; the hook raises
-# FATAL from inside that release.
-run_fatal_scenario('C2 fatal/abort-path', 'conformance.c2', <<'SQL');
+# FATAL from inside that release.  Two more spans share that owner, one
+# started before the FATAL span and one after it: resource-owner
+# release is LIFO (reverse of registration), so one of them is released
+# before the FATAL span is reached (in ROLLBACK's own abort processing,
+# the pass the FATAL cuts short) and the other only afterwards, by
+# backend exit's AbortOutOfAnyTransaction re-releasing the same owner.
+# Either way, each sibling must still be exported exactly once.
+my $c2_log = run_fatal_scenario('C2 fatal/abort-path', 'conformance.c2', <<'SQL');
 SELECT otel_api_conformance_set_emit_misbehaviour('fatal', 'conformance.c2');
 BEGIN;
+SELECT otel_api_conformance_start('conformance.c2.sibling_before', owner_mode => 'toptxn');
 SELECT otel_api_conformance_start('conformance.c2', owner_mode => 'toptxn');
+SELECT otel_api_conformance_start('conformance.c2.sibling_after', owner_mode => 'toptxn');
 SELECT 1/0;
 ROLLBACK;
 SQL
+
+for my $sib (qw(conformance.c2.sibling_before conformance.c2.sibling_after))
+{
+	is(count_dispatches($c2_log, $sib), 1,
+		"C2 fatal/abort-path: $sib (sharing the FATAL span's owner) is exported exactly once")
+	  or diag("server log:\n$c2_log");
+}
 
 $node->stop;
 done_testing();
