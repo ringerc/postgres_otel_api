@@ -301,6 +301,20 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_discard'
 LANGUAGE C VOLATILE STRICT;
 
+-- ----------------------------------------------------------------
+-- otel_span_activate()/otel_span_deactivate() (postgres-cdq.10).
+-- ----------------------------------------------------------------
+
+CREATE FUNCTION otel_api_conformance_activate(ref bigint)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'otel_api_conformance_activate'
+LANGUAGE C VOLATILE STRICT;
+
+CREATE FUNCTION otel_api_conformance_deactivate(token bigint)
+RETURNS void
+AS 'MODULE_PATHNAME', 'otel_api_conformance_deactivate'
+LANGUAGE C VOLATILE STRICT;
+
 CREATE FUNCTION otel_api_conformance_with_span(name text, sql text)
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'otel_api_conformance_with_span'

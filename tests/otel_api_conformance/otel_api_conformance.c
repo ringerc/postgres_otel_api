@@ -815,6 +815,9 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  "\"link_dropped\":" UINT64_FORMAT ","
 					  "\"error_capture_failed\":" UINT64_FORMAT ","
 					  "\"emit_hook_errors\":" UINT64_FORMAT ","
+					  "\"activate_not_detached\":" UINT64_FORMAT ","
+					  "\"activate_already_active\":" UINT64_FORMAT ","
+					  "\"deactivate_not_active\":" UINT64_FORMAT ","
 					  "\"conformance_sampler_calls\":" INT64_FORMAT ","
 					  "\"conformance_side_effect_calls\":" INT64_FORMAT ","
 					  "\"conformance_captured\":%d"
@@ -826,6 +829,8 @@ otel_api_conformance_counters(PG_FUNCTION_ARGS)
 					  c.leaked_at_commit, c.dropped_in_dispatch, c.open_at_exit,
 					  c.attr_truncated, c.attr_dropped, c.event_dropped, c.link_dropped,
 					  c.error_capture_failed, c.emit_hook_errors,
+					  c.activate_not_detached, c.activate_already_active,
+					  c.deactivate_not_active,
 					  conformance_sampler_calls, conformance_side_effect_calls,
 					  n_captured);
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(buf.data)));
@@ -1905,6 +1910,26 @@ otel_api_conformance_discard(PG_FUNCTION_ARGS)
 	OtelSpanRef s = {.v = PG_GETARG_INT64(0)};
 
 	otel_span_discard(s);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_activate);
+Datum
+otel_api_conformance_activate(PG_FUNCTION_ARGS)
+{
+	OtelSpanRef s = {.v = PG_GETARG_INT64(0)};
+	OtelActivation tok = otel_span_activate(s);
+
+	PG_RETURN_INT64(tok.v);
+}
+
+PG_FUNCTION_INFO_V1(otel_api_conformance_deactivate);
+Datum
+otel_api_conformance_deactivate(PG_FUNCTION_ARGS)
+{
+	OtelActivation tok = {.v = PG_GETARG_INT64(0)};
+
+	otel_span_deactivate(tok);
 	PG_RETURN_VOID();
 }
 
