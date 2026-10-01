@@ -22,6 +22,11 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'test_otel_count_spans_by_name'
 LANGUAGE C VOLATILE PARALLEL SAFE;
 
+CREATE FUNCTION test_otel_uncaptured_span_count()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'test_otel_uncaptured_span_count'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+
 CREATE FUNCTION test_otel_clear()
 RETURNS void
 AS 'MODULE_PATHNAME', 'test_otel_clear'

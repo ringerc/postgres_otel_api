@@ -98,6 +98,17 @@ static MemoryContext otel_test_cxt = NULL;
 static otel_span_emit_hook_type prev_emit_hook = NULL;
 
 /*
+ * test_otel_exporter.capture --- when off, the emit hook does nothing
+ * but bump otel_test_uncaptured_spans and return.  Used by the overhead
+ * benchmark (postgres-cdq.24) as a cheap "null exporter": any registered
+ * exporter makes otel_api's recording_possible true, but an exporter
+ * that doesn't deep-copy avoids measuring the ring-buffer copy cost
+ * alongside otel_api's own per-span cost.
+ */
+static bool otel_test_capture = true;
+static int64 otel_test_uncaptured_spans = 0;
+
+/*
  * This module's own tracer, for the producer-API roundtrip test
  * (test_otel_producer_roundtrip).  otel_api fills in ->scope on first
  * use; no explicit registration call is needed.
@@ -230,6 +241,14 @@ otel_test_emit_hook(const OtelSpan *span)
 	if (!otel_exporter_span_ok(span))
 		return;
 
+	if (!otel_test_capture)
+	{
+		otel_test_uncaptured_spans++;
+		if (prev_emit_hook)
+			prev_emit_hook(span);
+		return;
+	}
+
 	/* Allocations could fail under OOM --- per the contract we
 	 * silently swallow rather than escalate. */
 	PG_TRY();
@@ -272,6 +291,19 @@ _PG_init(void)
 										  "test_otel_exporter",
 										  ALLOCSET_DEFAULT_SIZES);
 
+	DefineCustomBoolVariable("test_otel_exporter.capture",
+							 "Deep-copy captured spans into the test ring buffer.",
+							 "Off makes this a null exporter: the emit hook only counts "
+							 "spans (see test_otel_uncaptured_span_count()).  For the "
+							 "otel_api overhead benchmark, which needs a registered "
+							 "exporter (to make recording_possible true) that doesn't "
+							 "itself add per-span copying cost.",
+							 &otel_test_capture,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	/*
 	 * Two-phase deferred registration.  If otel_api is already present
 	 * (provider loads first), register immediately.  Otherwise the
@@ -293,6 +325,17 @@ Datum
 test_otel_span_count(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(ring_count);
+}
+
+/*
+ * Number of spans the emit hook saw while test_otel_exporter.capture was
+ * off (counted, not copied).  See otel_test_capture above.
+ */
+PG_FUNCTION_INFO_V1(test_otel_uncaptured_span_count);
+Datum
+test_otel_uncaptured_span_count(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(otel_test_uncaptured_spans);
 }
 
 /*
