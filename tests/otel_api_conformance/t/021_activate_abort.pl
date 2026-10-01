@@ -249,6 +249,7 @@ SQL
 {
 	my $sql = <<'SQL';
 SELECT otel_api_conformance_reset();
+BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.unwind.a', owner_mode := 'session', detached := true) AS a \gset
 SELECT otel_api_conformance_activate(:a) AS tok_a \gset
 SELECT otel_api_conformance_start('conformance.activate.unwind.b', owner_mode := 'session', detached := true) AS b \gset
@@ -276,6 +277,7 @@ SELECT otel_api_conformance_recording(:b) AS b_still_open;
 SELECT otel_api_conformance_end(:b);
 SELECT jsonb_agg(sp) FROM otel_api_conformance_spans() sp WHERE sp->>'name' = 'conformance.activate.unwind.b';
 SELECT otel_api_conformance_end(:a);
+COMMIT;
 SQL
 		is($ret, 0, 'defect 2: completes without crashing (non-cassert build)')
 		  or diag("stderr: $stderr");
@@ -300,6 +302,7 @@ SQL
 {
 	my $sql = <<'SQL';
 SELECT otel_api_conformance_reset();
+BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.unwind.started_above.a', owner_mode := 'session', detached := true) AS a \gset
 SELECT otel_api_conformance_activate(:a) AS tok_a \gset
 SELECT otel_api_conformance_start('conformance.activate.unwind.started_above.c', owner_mode := 'session') AS c \gset
@@ -325,6 +328,7 @@ SQL
 			$sql . <<'SQL');
 SELECT jsonb_agg(sp) FROM otel_api_conformance_spans() sp WHERE sp->>'name' = 'conformance.activate.unwind.started_above.c';
 SELECT otel_api_conformance_end(:a);
+COMMIT;
 SQL
 		is($ret, 0, 'defect 2 variant: completes without crashing (non-cassert build)')
 		  or diag("stderr: $stderr");
