@@ -3,23 +3,26 @@
 # run-fdw.sh --- postgres_fdw overhead: pgbench against a loopback foreign
 # server in the same instance, across the benchmark states.  See README.md.
 #
-# Inputs (environment), besides those in lib.sh:
+# Inputs (environment), besides those in lib.sh (which also covers the
+# exporter/collector inputs for S5o/S6o: EXPORTER_LIB, OTELCOL,
+# COLLECTOR_CPUS, COLLECTOR_ENDPOINT/COLLECTOR_METRICS_URL):
 #   FDW_SO       required: postgres_fdw.so built with otel_api tracing
 #                (-DHAVE_OTEL_API)
 #   FDW_STUB_SO  required: postgres_fdw.so built against the stub header
 #                (S0)
 #   DURATION     seconds per measured run (default: 30)
 #   REPEATS      repeats per cell (default: 3)
-#   STATES       default: "S0 S1 S2 S3 S4 S5 S6"
+#   STATES       default: "S0 S1 S2 S3 S4 S5 S6" (S5o/S6o: real OTLP
+#                exporter + collector)
 #   SCRIPTS      default: "select_point select_range update_point"
 #   CLIENTS      default: "1 8"
 #
 # The install must already have otel_api, test_otel_exporter and
-# postgres_fdw's SQL and control files.  The harness copies FDW_SO or
-# FDW_STUB_SO into the pkglibdir for each state, and puts back what was
-# there on exit.
+# postgres_fdw's SQL and control files, and (for S5o/S6o) $EXPORTER_LIB's
+# .so in the pkglibdir.  The harness copies FDW_SO or FDW_STUB_SO into the
+# pkglibdir for each state, and puts back what was there on exit.
 #
-# Output: CSV on stdout --- state,script,clients,rep,tps,lat_ms,cycles_per_tx,instr_per_tx
+# Output: CSV on stdout --- state,script,clients,rep,$PGBENCH_CSV_HEADER
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -32,6 +35,19 @@ REPEATS=${REPEATS:-3}
 STATES=${STATES:-"S0 S1 S2 S3 S4 S5 S6"}
 SCRIPTS=${SCRIPTS:-"select_point select_range update_point"}
 CLIENTS=${CLIENTS:-"1 8"}
+
+# Spans per transaction each script's foreign-table access produces when
+# sampled, for the spans-dropped column.  Checked with
+# otel_api.emit_spans_to_log against the real postgres_fdw tracing port
+# (worktrees/postgres-p2-fdw): select_point is one cursor open + one fetch
+# (pg.fdw.cursor, pg.fdw.fetch); select_range and update_point aren't
+# characterised yet, so they're left out (empty spans_expected_per_tx).
+spans_per_tx() {
+	case "$1" in
+	select_point) echo 2 ;;
+	*) echo "" ;;
+	esac
+}
 
 bench_init otel_fdw_bench
 echo "# DURATION=$DURATION REPEATS=$REPEATS STATES='$STATES' SCRIPTS='$SCRIPTS' CLIENTS='$CLIENTS'" >&2
@@ -78,11 +94,10 @@ stop_pg
 for state in $STATES; do
 	echo "# state $state" >&2
 	install_fdw_so "$state"
-	configure_state "$state"
-	start_pg
-	setup_state_extensions "$state"
+	state_start "$state"
 
 	for script in $SCRIPTS; do
+		expected=$(spans_per_tx "$script")
 		for clients in $CLIENTS; do
 			# Start every cell from the same table: update_point leaves dead
 			# rows that make later scans cost more, which otherwise shows up
@@ -92,12 +107,12 @@ for state in $STATES; do
 			pgbench_run "$SCRIPT_DIR/scripts/$script.sql" "$clients" 5 >&2 || true
 
 			for rep in $(seq 1 "$REPEATS"); do
-				echo "$state,$script,$clients,$rep,$(pgbench_cell "$SCRIPT_DIR/scripts/$script.sql" "$clients" "$DURATION")"
+				echo "$state,$script,$clients,$rep,$(pgbench_cell "$SCRIPT_DIR/scripts/$script.sql" "$clients" "$DURATION" 3 "$expected")"
 			done
 		done
 	done
 
-	stop_pg
+	state_stop
 done
 
 echo "# done" >&2
