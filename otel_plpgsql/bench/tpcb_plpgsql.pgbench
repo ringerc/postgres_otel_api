@@ -1,0 +1,19 @@
+-- otel_plpgsql/bench/tpcb_plpgsql.pgbench
+--
+-- pgbench script for tpcb_plpgsql.sql: same random aid/tid/bid/delta
+-- distribution as pgbench's builtin tpcb-like script (see pgbench
+-- --builtin=tpcb-like), but the transaction body is one call into the
+-- plpgsql function instead of four inline UPDATE/INSERT statements.
+--
+--   pgbench -f tpcb_plpgsql.pgbench ...
+--
+-- Run tpcb_plpgsql.sql first to define the functions, against a
+-- database already initialised with `pgbench -i`.
+
+\set aid random(1, 100000 * :scale)
+\set bid random(1, 1 * :scale)
+\set tid random(1, 10 * :scale)
+\set delta random(-5000, 5000)
+BEGIN;
+SELECT otel_plpgsql_bench_tpcb(:aid, :tid, :bid, :delta);
+END;
