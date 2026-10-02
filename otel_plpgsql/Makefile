@@ -14,13 +14,14 @@
 # dir so the two compiles of the same .c file (different EXTENSION /
 # MODULE_big / PG_CPPFLAGS) never collide over one .o/.so.  This keeps the
 # single standard out-of-tree invocation used for every other extension in
-# this repo (see AGENTS/build-and-install.md) working unchanged for this
-# one too.
+# this repo working unchanged for this one too: build a separate out-of-tree
+# directory per install prefix, with VPATH pointing at this source directory
+# and PG_CONFIG at that prefix's pg_config, then `make ... install`.
 #
 # `installcheck` is NOT fanned to both variants: only the main variant has
 # TAP_TESTS wired up (otel_plpgsql_stub has NO_INSTALLCHECK).  Run it from
 # the main subdirectory once both variants are installed into the target
-# prefix (the stub build is exercised by t/006_stub_build.pl, loaded as
+# prefix (the stub build is exercised by t/007_stub_build.pl, loaded as
 # its own extension from inside the main variant's test suite).
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))

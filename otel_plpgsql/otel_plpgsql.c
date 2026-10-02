@@ -54,18 +54,19 @@
  * which one it's looking at.
  *
  * plpgsql_stmt_typename() is declared PGDLLEXPORT by plpgsql itself
- * (plpgsql.h) and called directly here, resolved at load time against
- * whatever already-loaded copy of plpgsql.so exports it --- there is no
- * link-time dependency.  Because this module is meant for
- * shared_preload_libraries, 'plpgsql' itself must appear in that same
- * list BEFORE this module (or otel_plpgsql_stub): preloaded libraries
- * are dlopen'd eagerly with every symbol resolved immediately, not
- * lazily on first use, so if plpgsql.so hasn't been loaded yet when this
- * module is, the postmaster fails to start with "undefined symbol:
- * plpgsql_stmt_typename".  (plpgsql isn't preloaded by default; it's
- * normally dlopen'd lazily on the first plpgsql function call.  This is
- * the same reason plprofiler/plpgsql_check document
- * shared_preload_libraries = 'plpgsql,<themselves>'.)
+ * (plpgsql.h), but is resolved lazily, through a function pointer
+ * (otel_plpgsql_stmt_typename() below) via
+ * load_external_function("$libdir/plpgsql", ...) on first use, rather
+ * than called directly: a direct call is a link-time reference that
+ * RTLD_NOW must resolve the moment this module itself is dlopen'd, which
+ * fails with "undefined symbol: plpgsql_stmt_typename" if plpgsql.so
+ * hasn't been loaded yet --- and for shared_preload_libraries, dlopen
+ * happens at postmaster start in whatever order the GUC lists the
+ * libraries, so a direct call would require 'plpgsql' to appear before
+ * this module (or otel_plpgsql_stub) in that list.  Resolving it lazily
+ * instead means load order doesn't matter: by the time any plugin hook
+ * can possibly run, plpgsql has necessarily already loaded itself (it's
+ * the one invoking the hooks).
  *
  * Built TWICE from this one source (see Makefile), the same way
  * tests/otel_api_microbench is:
@@ -116,6 +117,27 @@ static OtelTracer otel_plpgsql_tracer = {.name = "otel_plpgsql", .version = "1.0
 /* GUCs */
 static bool otel_plpgsql_enabled = true;
 static bool otel_plpgsql_trace_statements = true;
+
+/*
+ * Lazily-resolved plpgsql_stmt_typename(); see the file header comment.
+ */
+typedef const char *(*PlpgsqlStmtTypenameFn) (PLpgSQL_stmt *stmt);
+
+static PlpgsqlStmtTypenameFn otel_plpgsql_stmt_typename_fn = NULL;
+static bool otel_plpgsql_stmt_typename_resolved = false;
+
+static const char *
+otel_plpgsql_stmt_typename(PLpgSQL_stmt *stmt)
+{
+	if (!otel_plpgsql_stmt_typename_resolved)
+	{
+		otel_plpgsql_stmt_typename_fn = (PlpgsqlStmtTypenameFn)
+			load_external_function("$libdir/plpgsql", "plpgsql_stmt_typename",
+								   true, NULL);
+		otel_plpgsql_stmt_typename_resolved = true;
+	}
+	return otel_plpgsql_stmt_typename_fn(stmt);
+}
 
 /*
  * Registry of this backend's currently-open OTEL_OWNER_SESSION spans
@@ -514,7 +536,7 @@ otel_plpgsql_stmt_beg(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 		if (otel_span_recording(span))
 		{
 			otel_span_set_str(span, OTEL_PG_PLPGSQL_STMT_TYPE,
-							  plpgsql_stmt_typename(stmt));
+							  otel_plpgsql_stmt_typename(stmt));
 			otel_span_set_int(span, OTEL_SC_CODE_LINE_NUMBER, stmt->lineno);
 		}
 	}
