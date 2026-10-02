@@ -92,6 +92,10 @@ bench_init() {
 	EXPORTER_LIB=${EXPORTER_LIB:-postgres_otel_tracing_demo}
 	OTELCOL=${OTELCOL:-otelcol}
 	COLLECTOR_CPUS=${COLLECTOR_CPUS:-}
+	COLLECTOR_EXTERNAL=0
+	if [ -n "${COLLECTOR_ENDPOINT:-}" ] && [ -n "${COLLECTOR_METRICS_URL:-}" ]; then
+		COLLECTOR_EXTERNAL=1
+	fi
 
 	BINDIR=$("$PG_CONFIG" --bindir)
 	PKGLIBDIR=$("$PG_CONFIG" --pkglibdir)
@@ -259,7 +263,7 @@ is_exporter_state() {
 # (grpc URL for OTEL_EXPORTER_OTLP_ENDPOINT) and COLLECTOR_METRICS_URL (the
 # metrics scrape URL).
 collector_start() {
-	if [ -n "${COLLECTOR_ENDPOINT:-}" ] && [ -n "${COLLECTOR_METRICS_URL:-}" ]; then
+	if [ "$COLLECTOR_EXTERNAL" -eq 1 ]; then
 		COLLECTOR_MANAGED=0
 		echo "# using externally managed collector endpoint=$COLLECTOR_ENDPOINT metrics=$COLLECTOR_METRICS_URL" >&2
 		return
@@ -293,7 +297,13 @@ service:
       receivers: [otlp]
       exporters: [nop]
 EOF
-	on_cpus "$COLLECTOR_CPUS" "$OTELCOL" --config "$conf" >"$SCRATCH/collector.log" 2>&1 &
+	# Run the collector itself in the background, not a subshell around it,
+	# so COLLECTOR_PID is the process to stop.
+	if [ -n "$COLLECTOR_CPUS" ]; then
+		taskset -c "$COLLECTOR_CPUS" "$OTELCOL" --config "$conf" >"$SCRATCH/collector.log" 2>&1 &
+	else
+		"$OTELCOL" --config "$conf" >"$SCRATCH/collector.log" 2>&1 &
+	fi
 	COLLECTOR_PID=$!
 	local waited=0
 	until curl -sf "$COLLECTOR_METRICS_URL" >/dev/null 2>&1; do
@@ -312,17 +322,18 @@ EOF
 	echo "# collector pid=$COLLECTOR_PID endpoint=$COLLECTOR_ENDPOINT metrics=$COLLECTOR_METRICS_URL" >&2
 }
 
-# collector_stop: stop a collector collector_start started itself.  A no-op
-# for an externally managed collector, and clears COLLECTOR_ENDPOINT /
-# COLLECTOR_METRICS_URL either way so the next state re-decides.
+# collector_stop: stop a collector collector_start started itself, and
+# forget its endpoints.  A no-op for an externally managed collector.
 collector_stop() {
-	if [ "${COLLECTOR_MANAGED:-0}" -eq 1 ] && [ -n "${COLLECTOR_PID:-}" ]; then
+	[ "${COLLECTOR_MANAGED:-0}" -eq 1 ] || return 0
+	if [ -n "${COLLECTOR_PID:-}" ]; then
 		kill "$COLLECTOR_PID" 2>/dev/null || true
 		wait "$COLLECTOR_PID" 2>/dev/null || true
 	fi
 	COLLECTOR_PID=""
 	COLLECTOR_ENDPOINT=""
 	COLLECTOR_METRICS_URL=""
+	COLLECTOR_MANAGED=0
 }
 
 # collector_span_counts: read the collector's cumulative accepted/refused
