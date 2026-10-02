@@ -68,11 +68,11 @@ stop_pg
 for state in $STATES; do
 	echo "# state $state" >&2
 	configure_consumer "$state"
-	configure_state "$state"
-	start_pg
-	setup_state_extensions "$state"
+	state_start "$state"
 
 	for stmt in $STMT_SPANS; do
+		expected=5
+		[ "$stmt" = on ] && expected=23
 		for clients in $CLIENTS; do
 			# Same starting point for every cell: drop the history rows and
 			# the dead row versions the previous cell left.
@@ -82,13 +82,13 @@ for state in $STATES; do
 			pgbench_run "$WORKLOAD_DIR/tpcb_plpgsql.pgbench" "$clients" 5 >&2 || true
 
 			for rep in $(seq 1 "$REPEATS"); do
-				echo "$state,$stmt,$clients,$rep,$(pgbench_cell "$WORKLOAD_DIR/tpcb_plpgsql.pgbench" "$clients" "$DURATION")"
+				echo "$state,$stmt,$clients,$rep,$(pgbench_cell "$WORKLOAD_DIR/tpcb_plpgsql.pgbench" "$clients" "$DURATION" 3 "$expected")"
 			done
 			unset PGOPTIONS
 		done
 	done
 
-	stop_pg
+	state_stop
 done
 
 echo "# done" >&2
