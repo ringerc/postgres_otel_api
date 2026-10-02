@@ -385,7 +385,17 @@ perf_start() {
 	if [ "$PERF_OK" -eq 1 ]; then
 		perf stat -x, -e cycles,instructions -p "$pid" -o "$PERF_OUT" -- sleep "$seconds" >&2 2>&1 &
 		PERF_PID=$!
-		sleep 0.3
+		# Children forked before perf attaches aren't counted, so wait until
+		# its counters are open rather than for a fixed time.
+		local waited=0
+		until ls -l /proc/"$PERF_PID"/fd 2>/dev/null | grep -q 'perf_event'; do
+			sleep 0.05
+			waited=$((waited + 50))
+			if [ "$waited" -ge 5000 ]; then
+				echo "WARNING: perf did not attach to $pid within 5s" >&2
+				break
+			fi
+		done
 	fi
 }
 
