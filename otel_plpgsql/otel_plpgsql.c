@@ -156,8 +156,8 @@ otel_plpgsql_stmt_typename(PLpgSQL_stmt *stmt)
  * backend does next.
  *
  * This is a workaround for the fact that an otel_api span owner can only
- * be a ResourceOwner or the whole session (postgres-cdq.9.1 is the open
- * design question for a real third option, an owner tied to the
+ * be a ResourceOwner or the whole session (an open design question is a
+ * third option, an owner tied to the
  * top-level CALL/DO's own portal, which would make this registry
  * unnecessary).
  *
@@ -345,8 +345,8 @@ typedef struct PlpgsqlSpanState
 	 * top-level CALL to a procedure, or a top-level DO block, run
 	 * outside an explicit transaction block.  PLPGSQL_STMT_COMMIT /
 	 * PLPGSQL_STMT_ROLLBACK are only legal in exactly this case
-	 * (postgres-cdq.9.1 --- open design question for where a
-	 * transaction-controlling CALL's own span should attach).  A plain
+	 * (where a transaction-controlling CALL's own span should attach is an
+	 * open design question).  A plain
 	 * resource-owner-owned span open across an internal COMMIT gets
 	 * force-released (as a "leak") by that commit, which would leave our
 	 * own handles stale; ending a stale handle a second time at

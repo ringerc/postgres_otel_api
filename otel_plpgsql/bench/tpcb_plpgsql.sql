@@ -5,7 +5,7 @@
 -- teller, update branch, insert history), against the standard pgbench
 -- schema (pgbench_accounts/_tellers/_branches/_history, as created by
 -- `pgbench -i`).  Used by the otel_plpgsql overhead benchmark
--- (postgres-cdq.24.6/.24.8): a root pg.plpgsql.function span plus 4
+-- (tests/otel_api_bench/run-plpgsql.sh): a root pg.plpgsql.function span plus 4
 -- child function spans, each with statement spans under it when
 -- otel_plpgsql.trace_statements is on.
 --

@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
 # A top-level CALL to a procedure that COMMITs internally
-# (postgres-cdq.9.1, explicitly open/unsettled: where should a
-# transaction-controlling CALL's own span attach?).  Out of scope for
+# (an open design question: where should a transaction-controlling
+# CALL's own span attach?).  Out of scope for
 # this module beyond: don't crash, don't flood the log with misuse
 # warnings, and document what actually happens.
 #
