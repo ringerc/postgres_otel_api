@@ -415,29 +415,12 @@ otel_plpgsql_func_setup(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 {
 	PlpgsqlSpanState *st;
 
-	if (!otel_plpgsql_enabled)
+	/* Nothing can record: skip our own bookkeeping too, not just the spans. */
+	if (!otel_plpgsql_enabled || !otel_recording_possible())
 	{
 		estate->plugin_info = NULL;
 		return;
 	}
-
-#ifdef HAVE_OTEL_API
-	/*
-	 * Nothing can record (no exporter, no log emission): skip allocating
-	 * our own bookkeeping too, not just the spans.  otel_recording_possible_()
-	 * is otel_producer.h's own internal gate for otel_span_start() (the
-	 * trailing underscore marks it as that header's own internal helper,
-	 * not public API); the stub header has no equivalent (every call
-	 * there is already free), so this check only exists in the
-	 * HAVE_OTEL_API build.  Replace this call if otel_producer.h ever
-	 * grows a public equivalent.
-	 */
-	if (!otel_recording_possible_())
-	{
-		estate->plugin_info = NULL;
-		return;
-	}
-#endif
 
 	st = (PlpgsqlSpanState *) palloc(sizeof(PlpgsqlSpanState));
 	st->func_span = OTEL_SPAN_NONE;
