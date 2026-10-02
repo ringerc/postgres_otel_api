@@ -21,23 +21,37 @@
  * otel_plpgsql.trace_statements.
  *
  * func_end/stmt_end are not called when a statement raises an ERROR that
- * isn't caught below this module: otel_api's own resource-owner release
- * at transaction abort ends every still-open span with ERROR status, so
- * nothing special is needed here for that path.  An error caught by a
- * BEGIN ... EXCEPTION block is different: plpgsql runs the protected
- * statements in a subtransaction, and when one of them raises, plpgsql's
- * own PG_CATCH rolls that subtransaction back (which releases --- and so
- * ends, with ERROR status --- every span owned by it or a nested one)
- * and then runs the exception handler's statements, all before this
- * module's stmt_end is ever called for the block.  So our own bookkeeping
- * (a stack of {stmtid, span} pushed in stmt_beg) can hold entries whose
- * span handle is already gone by the time stmt_end for an *enclosing*
+ * isn't caught below this module.  For an ordinary (atomic) call, that's
+ * fine without any help from this module: otel_api's own resource-owner
+ * release at transaction (or subtransaction) abort ends every still-open
+ * default-owned span with ERROR status.  An error caught by a BEGIN ...
+ * EXCEPTION block is similar: plpgsql runs the protected statements in a
+ * subtransaction, and when one of them raises, plpgsql's own PG_CATCH
+ * rolls that subtransaction back (which releases --- and so ends, with
+ * ERROR status --- every default-owned span opened inside it) and then
+ * runs the exception handler's statements, all before this module's
+ * stmt_end is ever called for the block.  So our own bookkeeping (a
+ * stack of {stmtid, span} pushed in stmt_beg) can hold entries whose span
+ * handle is already gone by the time stmt_end for an *enclosing*
  * statement runs; see otel_plpgsql_stmt_end() below for how that's
  * resynced --- the rule is simply: never call the producer API again on
  * a stack entry that isn't the exact one stmt_end was called for, because
  * the ones underneath might already be stale (a stale handle is a
  * counted no-op in production builds, but an Assert failure in cassert
  * builds).
+ *
+ * A nonatomic invocation (PlpgsqlSpanState.use_session_owner, below) uses
+ * OTEL_OWNER_SESSION instead, which has no resource owner at all, so
+ * NOTHING auto-ends those spans on abort; this module's own
+ * SubXactCallback/XactCallback (otel_plpgsql_subxact_callback(),
+ * otel_plpgsql_xact_callback()) do that job instead, against a registry
+ * of this backend's currently-open session spans
+ * (otel_plpgsql_session_push()/_forget(), and the comment on
+ * PlpgsqlSessionSpan) --- by the time stmt_end's resync above ever runs,
+ * any session span that needed force-ending has already been, so the
+ * same resync logic (discard the stale bookkeeping, never touch the
+ * handle again) is correct for both owner modes without needing to know
+ * which one it's looking at.
  *
  * plpgsql_stmt_typename() is declared PGDLLEXPORT by plpgsql itself
  * (plpgsql.h) and called directly here, resolved at load time against
@@ -69,6 +83,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
@@ -101,6 +116,168 @@ static OtelTracer otel_plpgsql_tracer = {.name = "otel_plpgsql", .version = "1.0
 /* GUCs */
 static bool otel_plpgsql_enabled = true;
 static bool otel_plpgsql_trace_statements = true;
+
+/*
+ * Registry of this backend's currently-open OTEL_OWNER_SESSION spans
+ * (every span opened during a nonatomic invocation --- see the comment
+ * on PlpgsqlSpanState.use_session_owner below), across every plpgsql
+ * invocation on the C stack right now.  A session span has no resource
+ * owner, so nothing auto-ends it the way otel_api ends a default-owned
+ * span on abort; left alone, an invocation that never reaches its own
+ * func_end/stmt_end (an uncaught ERROR, or a BEGIN...EXCEPTION block
+ * that catches one without this module's bookkeeping knowing to end the
+ * span itself) would leak it forever: still open, and still sitting on
+ * otel_api's active stack, silently becoming the parent of whatever the
+ * backend does next.
+ *
+ * This is a workaround for the fact that an otel_api span owner can only
+ * be a ResourceOwner or the whole session (postgres-cdq.9.1 is the open
+ * design question for a real third option, an owner tied to the
+ * top-level CALL/DO's own portal, which would make this registry
+ * unnecessary).
+ *
+ * nest_level is GetCurrentTransactionNestLevel() at the time the span
+ * was opened.  Entries are pushed in call order and so are always
+ * non-decreasing in nest_level from index 0 (oldest/shallowest) to the
+ * top (newest/deepest) --- subtransaction nesting can only get deeper
+ * one level at a time, never jump to a shallower level without first
+ * ending everything opened at the deeper ones. That means every entry
+ * this module ever needs to force-end on an abort is exactly a
+ * contiguous suffix of this array, and ending from the top down is
+ * automatically innermost-first.
+ *
+ * Closing a span normally (func_end/stmt_end reaching it without any
+ * abort in between) always removes the top entry: these spans close in
+ * the same properly-nested order they were opened in, same as each
+ * invocation's own local stmt stack, and anything pushed after a given
+ * entry but not yet closed has always already been force-closed by the
+ * callbacks below before stmt_end's resync (otel_plpgsql_stmt_end())
+ * can run.
+ *
+ * Lives in TopMemoryContext: it must survive the aborted statement's
+ * own context being reset (the longjmp past an uncaught ERROR skips
+ * func_end, so otel_plpgsql_func_setup() never gets to free this itself
+ * the way it frees everything else), and it must survive as backend-wide
+ * state since nothing here is tied to one specific invocation's memory.
+ */
+typedef struct PlpgsqlSessionSpan
+{
+	OtelSpanRef span;
+	int			nest_level;
+} PlpgsqlSessionSpan;
+
+static PlpgsqlSessionSpan *otel_plpgsql_session_stack = NULL;
+static int	otel_plpgsql_session_depth = 0;
+static int	otel_plpgsql_session_capacity = 0;
+
+static void
+otel_plpgsql_session_push(OtelSpanRef span)
+{
+	if (span.v == 0)
+		return;
+
+	if (otel_plpgsql_session_stack == NULL)
+	{
+		otel_plpgsql_session_capacity = 8;
+		otel_plpgsql_session_stack = (PlpgsqlSessionSpan *)
+			MemoryContextAlloc(TopMemoryContext,
+							  sizeof(PlpgsqlSessionSpan) * otel_plpgsql_session_capacity);
+	}
+	else if (otel_plpgsql_session_depth == otel_plpgsql_session_capacity)
+	{
+		otel_plpgsql_session_capacity *= 2;
+		otel_plpgsql_session_stack = (PlpgsqlSessionSpan *)
+			repalloc(otel_plpgsql_session_stack,
+					sizeof(PlpgsqlSessionSpan) * otel_plpgsql_session_capacity);
+	}
+
+	otel_plpgsql_session_stack[otel_plpgsql_session_depth].span = span;
+	otel_plpgsql_session_stack[otel_plpgsql_session_depth].nest_level =
+		GetCurrentTransactionNestLevel();
+	otel_plpgsql_session_depth++;
+}
+
+/*
+ * Forget a session span this module is about to end itself, normally,
+ * from func_end/stmt_end.  Always the top entry; see the file-scope
+ * comment on PlpgsqlSessionSpan.
+ */
+static void
+otel_plpgsql_session_forget(OtelSpanRef span)
+{
+	if (span.v == 0)
+		return;
+
+	Assert(otel_plpgsql_session_depth > 0);
+	Assert(otel_plpgsql_session_stack[otel_plpgsql_session_depth - 1].span.v == span.v);
+
+	if (otel_plpgsql_session_depth > 0)
+		otel_plpgsql_session_depth--;
+}
+
+/* End a leaked session span with ERROR status; never touch it again. */
+static void
+otel_plpgsql_end_leaked_session_span(OtelSpanRef span)
+{
+	otel_span_set_status(span, OTEL_STATUS_ERROR,
+						 "otel_plpgsql: ended at transaction/subtransaction abort "
+						 "(an OTEL_OWNER_SESSION span opened during a nonatomic "
+						 "PL/pgSQL call, with no resource owner to release it "
+						 "automatically)");
+	otel_span_end(span);
+}
+
+/*
+ * SubXactCallback: a subtransaction abort doesn't touch a session span
+ * (it has no resource owner), but it still needs to end --- with ERROR
+ * status --- everything this module opened at or below the aborting
+ * level, same as otel_api's own resource-owner release does for a
+ * default-owned span.  Ending from the top (innermost/deepest) down
+ * guarantees each end() finds its target already at the top of otel_api's
+ * active stack too, so this never triggers otel_api's own
+ * out-of-order/LIFO-violation unwind path.
+ */
+static void
+otel_plpgsql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+							  SubTransactionId parentSubid, void *arg)
+{
+	int			current_level;
+
+	if (event != SUBXACT_EVENT_ABORT_SUB)
+		return;
+
+	current_level = GetCurrentTransactionNestLevel();
+	while (otel_plpgsql_session_depth > 0 &&
+		   otel_plpgsql_session_stack[otel_plpgsql_session_depth - 1].nest_level
+		   >= current_level)
+	{
+		otel_plpgsql_session_depth--;
+		otel_plpgsql_end_leaked_session_span(
+			otel_plpgsql_session_stack[otel_plpgsql_session_depth].span);
+	}
+}
+
+/*
+ * XactCallback: a top-level abort (or a parallel worker's) undoes every
+ * subtransaction at once, so drain the whole registry, innermost first.
+ * Nothing to do on commit: by then every session span this module ever
+ * opened should already have been ended, normally, by its own
+ * func_end/stmt_end --- if one wasn't, that is a bug to notice, not to
+ * silently paper over here.
+ */
+static void
+otel_plpgsql_xact_callback(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+
+	while (otel_plpgsql_session_depth > 0)
+	{
+		otel_plpgsql_session_depth--;
+		otel_plpgsql_end_leaked_session_span(
+			otel_plpgsql_session_stack[otel_plpgsql_session_depth].span);
+	}
+}
 
 /*
  * One stack entry per currently-open PL/pgSQL statement in this function
@@ -146,11 +323,15 @@ typedef struct PlpgsqlSpanState
 	 * OTEL_OWNER_SESSION instead of the default (CurrentResourceOwner):
 	 * a session span isn't tied to any resource owner, so it survives an
 	 * inner COMMIT/ROLLBACK untouched and we close it ourselves as usual
-	 * from func_end/stmt_end.  The trade-off, confined to this narrow
-	 * case: an uncaught ERROR no longer auto-ends these spans (there is
-	 * no owner release to do it), so they leak for the rest of the
-	 * session instead of being exported with ERROR status.  See
-	 * t/008_call_commit.pl.
+	 * from func_end/stmt_end.  Because a session span then has nothing
+	 * auto-ending it on abort either, every span opened this way is also
+	 * registered with otel_plpgsql_session_push() (see the comment on
+	 * PlpgsqlSessionSpan), so an uncaught error --- or one caught by a
+	 * BEGIN...EXCEPTION block inside the same nonatomic call --- still
+	 * ends it, with ERROR status, via this module's own abort callbacks
+	 * instead of otel_api's resource-owner release.  See
+	 * t/008_call_commit.pl, t/010_nonatomic_uncaught_error.pl and
+	 * t/011_nonatomic_caught_exception.pl.
 	 */
 	bool		use_session_owner;
 
@@ -207,6 +388,21 @@ otel_plpgsql_func_setup(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 		return;
 	}
 
+#ifdef HAVE_OTEL_API
+	/*
+	 * Nothing can record (no exporter, no log emission): skip allocating
+	 * our own bookkeeping too, not just the spans.  otel_recording_possible_()
+	 * is otel_producer.h's own internal gate for otel_span_start(); the
+	 * stub header has no equivalent (every call there is already free), so
+	 * this check only exists in the HAVE_OTEL_API build.
+	 */
+	if (!otel_recording_possible_())
+	{
+		estate->plugin_info = NULL;
+		return;
+	}
+#endif
+
 	st = (PlpgsqlSpanState *) palloc(sizeof(PlpgsqlSpanState));
 	st->func_span = OTEL_SPAN_NONE;
 
@@ -257,6 +453,9 @@ otel_plpgsql_func_beg(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 									.kind = OTEL_SPAN_KIND_INTERNAL,
 									.owner = otel_plpgsql_owner(st));
 
+	if (st->use_session_owner)
+		otel_plpgsql_session_push(st->func_span);
+
 	if (otel_span_recording(st->func_span))
 	{
 		otel_span_set_str(st->func_span, OTEL_SC_CODE_FUNCTION_NAME,
@@ -283,6 +482,9 @@ otel_plpgsql_func_end(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 	 */
 	st->depth = 0;
 
+	if (st->use_session_owner)
+		otel_plpgsql_session_forget(st->func_span);
+
 	otel_span_end(st->func_span);
 	st->func_span = OTEL_SPAN_NONE;
 }
@@ -305,6 +507,9 @@ otel_plpgsql_stmt_beg(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 							   .name = "pg.plpgsql.stmt",
 							   .kind = OTEL_SPAN_KIND_INTERNAL,
 							   .owner = otel_plpgsql_owner(st));
+
+		if (st->use_session_owner)
+			otel_plpgsql_session_push(span);
 
 		if (otel_span_recording(span))
 		{
@@ -345,6 +550,8 @@ otel_plpgsql_stmt_end(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 		return;					/* no matching entry; nothing to end */
 
 	st->depth--;
+	if (st->use_session_owner)
+		otel_plpgsql_session_forget(st->stack[st->depth].span);
 	otel_span_end(st->stack[st->depth].span);
 }
 
@@ -376,6 +583,15 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("otel_plpgsql");
+
+	/*
+	 * Keep the OTEL_OWNER_SESSION registry in sync on abort; see the
+	 * file-scope comment on PlpgsqlSessionSpan.  Registered unconditionally
+	 * (cheap no-op drains of an empty registry when nothing nonatomic is
+	 * running, or when otel_plpgsql.enabled is off).
+	 */
+	RegisterXactCallback(otel_plpgsql_xact_callback, NULL);
+	RegisterSubXactCallback(otel_plpgsql_subxact_callback, NULL);
 
 	/*
 	 * Rendezvous with plpgsql: find_rendezvous_variable() creates the
