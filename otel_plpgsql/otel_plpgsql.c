@@ -43,15 +43,17 @@
  * A nonatomic invocation (PlpgsqlSpanState.use_session_owner, below) uses
  * OTEL_OWNER_SESSION instead, which has no resource owner at all, so
  * NOTHING auto-ends those spans on abort; this module's own
- * SubXactCallback/XactCallback (otel_plpgsql_subxact_callback(),
- * otel_plpgsql_xact_callback()) do that job instead, against a registry
- * of this backend's currently-open session spans
- * (otel_plpgsql_session_push()/_forget(), and the comment on
- * PlpgsqlSessionSpan) --- by the time stmt_end's resync above ever runs,
- * any session span that needed force-ending has already been, so the
- * same resync logic (discard the stale bookkeeping, never touch the
+ * ResourceReleaseCallback (otel_plpgsql_resource_release_callback()) does
+ * that job instead, against a registry of this backend's currently-open
+ * session spans (otel_plpgsql_session_push()/_forget(), and the comment
+ * on PlpgsqlSessionSpan) --- by the time stmt_end's resync above ever
+ * runs, any session span that needed force-ending has already been, so
+ * the same resync logic (discard the stale bookkeeping, never touch the
  * handle again) is correct for both owner modes without needing to know
- * which one it's looking at.
+ * which one it's looking at.  See the comment on
+ * otel_plpgsql_resource_release_callback() itself for why a
+ * ResourceReleaseCallback, specifically, rather than the more obvious
+ * SubXactCallback/XactCallback.
  *
  * plpgsql_stmt_typename() is declared PGDLLEXPORT by plpgsql itself
  * (plpgsql.h), but is resolved lazily, through a function pointer
@@ -89,6 +91,7 @@
 #include "miscadmin.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #include "plpgsql.h"
 
@@ -250,50 +253,58 @@ otel_plpgsql_end_leaked_session_span(OtelSpanRef span)
 }
 
 /*
- * SubXactCallback: a subtransaction abort doesn't touch a session span
- * (it has no resource owner), but it still needs to end --- with ERROR
- * status --- everything this module opened at or below the aborting
- * level, same as otel_api's own resource-owner release does for a
- * default-owned span.  Ending from the top (innermost/deepest) down
- * guarantees each end() finds its target already at the top of otel_api's
- * active stack too, so this never triggers otel_api's own
- * out-of-order/LIFO-violation unwind path.
+ * ResourceReleaseCallback, not a SubXactCallback/XactCallback: a
+ * SubXactCallback(SUBXACT_EVENT_ABORT_SUB)/XactCallback(XACT_EVENT_ABORT)
+ * fires from AbortSubTransaction()/AbortTransaction() BEFORE that
+ * function's own ResourceOwnerRelease() calls --- i.e. before otel_api
+ * ends any DEFAULT-owned span (statement spans from otel_postgres_tracing,
+ * or from an ordinary atomic plpgsql call reached from inside this
+ * nonatomic one) via its own resource-owner release.  If such a span
+ * happens to sit above one of ours on otel_api's active stack at that
+ * point --- readily possible: a nonatomic DO/CALL's own BEGIN...EXCEPTION
+ * block calling an atomic function that raises, or just one plain
+ * statement erroring with otel_postgres_tracing wrapping it --- ending
+ * our session span first is itself a LIFO violation against the
+ * default-owned one still sitting above it (otel_api WARNING, Assert
+ * failure on a cassert build: see t/013_nonatomic_inner_atomic_raise.pl
+ * and t/014_with_otel_postgres_tracing.pl, both confirmed crashing
+ * against a SubXactCallback/XactCallback-based version of this function).
+ *
+ * A ResourceReleaseCallback instead runs as part of
+ * ResourceOwnerReleaseInternal(), once per resource owner in the tree,
+ * AFTER that owner's own phase-specific resources (for RESOURCE_RELEASE_
+ * BEFORE_LOCKS, that includes any default-owned otel_api span tied to
+ * it) are already released --- and AbortSubTransaction()/AbortTransaction()
+ * run a full BEFORE_LOCKS pass over the WHOLE owner tree before the
+ * later LOCKS and AFTER_LOCKS passes, so by the time THIS callback fires
+ * for RESOURCE_RELEASE_AFTER_LOCKS, every default-owned span anywhere in
+ * that tree, at any nesting depth, is already gone. Draining our own
+ * registry at that point can never find a default-owned span still
+ * above one of ours.
+ *
+ * Runs once per resource owner at every phase and on commit too; ignore
+ * everything except RESOURCE_RELEASE_AFTER_LOCKS on an abort, and be
+ * content to find nothing left to do on the (likely several) further
+ * calls for the same abort --- the same nest-level comparison as before
+ * (now against GetCurrentTransactionNestLevel() as it reads at this
+ * point in Abort{Sub,}Transaction, still before the nesting level
+ * itself is popped) naturally covers both a subtransaction abort and a
+ * full top-level abort (nest level 1: drains everything).
  */
 static void
-otel_plpgsql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
-							  SubTransactionId parentSubid, void *arg)
+otel_plpgsql_resource_release_callback(ResourceReleasePhase phase,
+									   bool isCommit, bool isTopLevel,
+									   void *arg)
 {
 	int			current_level;
 
-	if (event != SUBXACT_EVENT_ABORT_SUB)
+	if (isCommit || phase != RESOURCE_RELEASE_AFTER_LOCKS)
 		return;
 
 	current_level = GetCurrentTransactionNestLevel();
 	while (otel_plpgsql_session_depth > 0 &&
 		   otel_plpgsql_session_stack[otel_plpgsql_session_depth - 1].nest_level
 		   >= current_level)
-	{
-		otel_plpgsql_session_depth--;
-		otel_plpgsql_end_leaked_session_span(
-			otel_plpgsql_session_stack[otel_plpgsql_session_depth].span);
-	}
-}
-
-/*
- * XactCallback: a top-level abort (or a parallel worker's) undoes every
- * subtransaction at once, so drain the whole registry, innermost first.
- * Nothing to do on commit: by then every session span this module ever
- * opened should already have been ended, normally, by its own
- * func_end/stmt_end --- if one wasn't, that is a bug to notice, not to
- * silently paper over here.
- */
-static void
-otel_plpgsql_xact_callback(XactEvent event, void *arg)
-{
-	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
-		return;
-
-	while (otel_plpgsql_session_depth > 0)
 	{
 		otel_plpgsql_session_depth--;
 		otel_plpgsql_end_leaked_session_span(
@@ -414,9 +425,12 @@ otel_plpgsql_func_setup(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 	/*
 	 * Nothing can record (no exporter, no log emission): skip allocating
 	 * our own bookkeeping too, not just the spans.  otel_recording_possible_()
-	 * is otel_producer.h's own internal gate for otel_span_start(); the
-	 * stub header has no equivalent (every call there is already free), so
-	 * this check only exists in the HAVE_OTEL_API build.
+	 * is otel_producer.h's own internal gate for otel_span_start() (the
+	 * trailing underscore marks it as that header's own internal helper,
+	 * not public API); the stub header has no equivalent (every call
+	 * there is already free), so this check only exists in the
+	 * HAVE_OTEL_API build.  Replace this call if otel_producer.h ever
+	 * grows a public equivalent.
 	 */
 	if (!otel_recording_possible_())
 	{
@@ -608,12 +622,13 @@ _PG_init(void)
 
 	/*
 	 * Keep the OTEL_OWNER_SESSION registry in sync on abort; see the
-	 * file-scope comment on PlpgsqlSessionSpan.  Registered unconditionally
-	 * (cheap no-op drains of an empty registry when nothing nonatomic is
-	 * running, or when otel_plpgsql.enabled is off).
+	 * comment on otel_plpgsql_resource_release_callback() for why this is
+	 * a ResourceReleaseCallback and not a SubXactCallback/XactCallback.
+	 * Registered unconditionally (cheap no-op drains of an empty registry
+	 * when nothing nonatomic is running, or when otel_plpgsql.enabled is
+	 * off).
 	 */
-	RegisterXactCallback(otel_plpgsql_xact_callback, NULL);
-	RegisterSubXactCallback(otel_plpgsql_subxact_callback, NULL);
+	RegisterResourceReleaseCallback(otel_plpgsql_resource_release_callback, NULL);
 
 	/*
 	 * Rendezvous with plpgsql: find_rendezvous_variable() creates the
