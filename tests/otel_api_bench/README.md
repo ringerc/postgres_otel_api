@@ -7,6 +7,9 @@ states an operator can put a server in.
   counting, and a `pgbench` cell runner. Sourced by the harness scripts.
 - `run-fdw.sh`: `postgres_fdw` against a loopback foreign server in the same
   instance, under `pgbench`.
+- `run-plpgsql.sh`: `otel_plpgsql` tracing pgbench's TPC-B-like transaction
+  written as a plpgsql function calling four helpers. Local work, no IPC.
+  Statement spans on and off (`STMT_SPANS`); scale `SCALE`.
 - `../otel_api_microbench/run.sh`: per-span cost in isolation.
 
 ## States
