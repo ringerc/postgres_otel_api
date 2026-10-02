@@ -1,0 +1,5 @@
+# otel_plpgsql extension
+comment = 'OpenTelemetry tracing for PL/pgSQL functions and procedures'
+default_version = '0.1'
+module_pathname = '$libdir/otel_plpgsql'
+relocatable = true

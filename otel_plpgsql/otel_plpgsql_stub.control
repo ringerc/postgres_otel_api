@@ -1,0 +1,5 @@
+# otel_plpgsql_stub extension
+comment = 'OpenTelemetry tracing for PL/pgSQL functions and procedures, S0 stub build (otel_api hooks compiled out)'
+default_version = '0.1'
+module_pathname = '$libdir/otel_plpgsql_stub'
+relocatable = true
