@@ -6,11 +6,16 @@
  *	  plpgsql itself is not modified.
  *
  * One span per function/procedure call (pg.plpgsql.function), nested by
- * call: the outermost call (no span on otel_api's active stack) starts a
- * new root, so sampling is decided per call; a call made while a span is
- * already active (an enclosing otel_postgres_tracing statement span, a
- * propagated context turned into an active span by some other producer,
- * or an outer plpgsql call/statement) becomes a child of it.
+ * call: the default parent (OTEL_PARENT_ACTIVE) picks up the top of
+ * otel_api's active stack when there is one (an enclosing
+ * otel_postgres_tracing statement span, an outer plpgsql call/statement,
+ * or anything else a producer activated), and otherwise the backend's
+ * propagated root context (otel_api.traceparent / sqlcommenter / the 'M'
+ * header) if there is one, so a client that propagates trace context
+ * gets plpgsql spans in that trace even with nothing else on the active
+ * stack.  Only with no active span AND no root context does a call start
+ * a brand-new trace --- still decided (and sampled) fresh per outermost
+ * call in that case, since there is nothing to inherit from.
  *
  * Optionally, one span per statement (pg.plpgsql.stmt), gated by
  * otel_plpgsql.trace_statements.
@@ -227,8 +232,6 @@ static void
 otel_plpgsql_func_beg(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 {
 	PlpgsqlSpanState *st = (PlpgsqlSpanState *) estate->plugin_info;
-	OtelSpanRef cur;
-	OtelSpanParent parent;
 
 	if (st == NULL)
 		return;
@@ -237,21 +240,21 @@ otel_plpgsql_func_beg(PLpgSQL_execstate *estate, PLpgSQL_function *func)
 	st->use_session_owner = !estate->atomic;
 
 	/*
-	 * A new root only when nothing is active: this call's sampling
-	 * decision is then made fresh (otel_api.sampler), independent of
-	 * whatever long-lived root context (otel_api.traceparent / M header)
-	 * might otherwise be inherited.  When something is active --- a
-	 * statement span from otel_postgres_tracing, an outer plpgsql
-	 * function/statement span, or anything else a producer activated ---
-	 * this call is simply its child, as usual.
+	 * Default parent (OTEL_PARENT_ACTIVE): top of the active stack if
+	 * one is there (an outer plpgsql function/statement span, a
+	 * statement span from otel_postgres_tracing, or anything else a
+	 * producer activated); otherwise the backend's root context
+	 * (otel_api.traceparent, sqlcommenter, or the 'M' protocol header),
+	 * so a client that propagates trace context gets plpgsql spans IN
+	 * that trace even when nothing else put a span on the active stack
+	 * first; and only when there is no context at all either does this
+	 * start a brand-new trace --- still decided (and sampled) fresh for
+	 * each outermost call, since nothing is on the stack and there is no
+	 * root context to inherit from.
 	 */
-	cur = otel_span_current();
-	parent = (cur.v != 0) ? OTEL_PARENT_ACTIVE : OTEL_PARENT_ROOT;
-
 	st->func_span = otel_span_start(.tracer = &otel_plpgsql_tracer,
 									.name = "pg.plpgsql.function",
 									.kind = OTEL_SPAN_KIND_INTERNAL,
-									.parent = parent,
 									.owner = otel_plpgsql_owner(st));
 
 	if (otel_span_recording(st->func_span))
