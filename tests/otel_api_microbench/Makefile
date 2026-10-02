@@ -14,7 +14,7 @@
 # dir so the two compiles of the same .c file (different EXTENSION /
 # MODULE_big / PG_CPPFLAGS) never collide over one .o/.so.  This keeps the
 # single standard out-of-tree invocation used for every other extension in
-# this repo (see AGENTS/build-and-install.md) working unchanged for this
+# this repo working unchanged for this
 # one too.
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))

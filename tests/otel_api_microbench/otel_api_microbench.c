@@ -10,7 +10,7 @@
  *   otel_api_microbench_stub  against the local copy of otel_producer_stub.h
  *                             (+ otel_types.h), i.e. S0 "hooks compiled out"
  *
- * See docs/plans/otel-overhead-bench.md, "Microbenchmark extension".
+ * States and runner: ../otel_api_bench/README.md, run.sh.
  *
  * NOT part of otel_api; do not link against it.
  *
