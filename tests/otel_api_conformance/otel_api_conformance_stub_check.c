@@ -62,5 +62,6 @@ otel_api_conformance_stub_check(void)
 	otel_resource_add("k", "v");
 	otel_span_end_at(s, 0);
 	otel_span_end(s);
+	(void) otel_recording_possible();
 	(void) otel_span_recording(s);
 }

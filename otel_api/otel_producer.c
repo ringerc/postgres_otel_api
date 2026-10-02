@@ -2027,7 +2027,7 @@ api_span_deactivate(OtelActivation tok)
 const OtelProducerApi otel_producer_api_table = {
 	.version = OTEL_PRODUCER_API_VERSION,
 	.struct_size = sizeof(OtelProducerApi),
-	.recording_possible = &otel_recording_possible,
+	.recording_possible = &otel_recording_possible_flag,
 	.span_start = api_span_start,
 	.span_end = api_span_end,
 	.span_set_str = api_span_set_str,

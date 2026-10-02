@@ -55,7 +55,7 @@ extern void otel_api_publish_rendezvous(void);
 extern otel_span_emit_hook_type otel_get_span_emit_hook(void);
 extern OtelSamplerDecision otel_run_sampler(const OtelTraceId *trace_id,
 											bool new_root, bool remote_sampled);
-extern bool otel_recording_possible;
+extern bool otel_recording_possible_flag;
 extern void otel_update_recording_possible(void);
 
 /* otel_resource.c */

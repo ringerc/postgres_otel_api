@@ -830,6 +830,13 @@ otel_api_conformance_end(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PG_FUNCTION_INFO_V1(otel_api_conformance_recording_possible);
+Datum
+otel_api_conformance_recording_possible(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(otel_recording_possible());
+}
+
 PG_FUNCTION_INFO_V1(otel_api_conformance_recording);
 Datum
 otel_api_conformance_recording(PG_FUNCTION_ARGS)

@@ -34,12 +34,12 @@ static otel_span_emit_hook_type otel_span_emit_hook = NULL;
  * emission.  Producers read it inline through the producer table, so
  * "otel_api loaded, nothing consuming spans" costs no call per span.
  */
-bool		otel_recording_possible = false;
+bool		otel_recording_possible_flag = false;
 
 void
 otel_update_recording_possible(void)
 {
-	otel_recording_possible = otel_span_emit_hook != NULL ||
+	otel_recording_possible_flag = otel_span_emit_hook != NULL ||
 		otel_emit_spans_to_log;
 }
 

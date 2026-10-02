@@ -325,13 +325,14 @@ otel_producer_api(void)
 }
 
 /*
- * The gate otel_span_start() needs, split out so the macro can test it
- * before building an OtelSpanStartArgs: with nothing to record, no
- * struct should ever be materialised.  Also used by
- * otel_span_start_args() itself, so a direct call gets the same check.
+ * False when no span started now could be recorded: otel_api isn't
+ * loaded, or nothing consumes spans (no exporter registered, log emission
+ * off).  True doesn't mean a span will be sampled.  Lets a producer skip
+ * its own per-call setup in the common untraced case; otel_span_start()
+ * already checks it, before building its arguments.
  */
 static inline bool
-otel_recording_possible_(void)
+otel_recording_possible(void)
 {
 	const OtelProducerApi *p = otel_producer_api();
 
@@ -341,7 +342,7 @@ otel_recording_possible_(void)
 static inline OtelSpanRef
 otel_span_start_args(const OtelSpanStartArgs *args)
 {
-	if (!otel_recording_possible_())
+	if (!otel_recording_possible())
 		return OTEL_SPAN_NONE;
 	return otel_producer_api()->span_start(args);
 }
@@ -354,7 +355,7 @@ otel_span_start_args(const OtelSpanStartArgs *args)
  * with recording not possible, nothing is stored to build it.
  */
 #define otel_span_start(...) \
-	(otel_recording_possible_() \
+	(otel_recording_possible() \
 	 ? otel_span_start_args(&(OtelSpanStartArgs) { \
 			.struct_size = sizeof(OtelSpanStartArgs), __VA_ARGS__ }) \
 	 : OTEL_SPAN_NONE)

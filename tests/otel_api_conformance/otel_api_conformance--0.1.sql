@@ -46,6 +46,11 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'otel_api_conformance_end'
 LANGUAGE C VOLATILE STRICT;
 
+CREATE FUNCTION otel_api_conformance_recording_possible()
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'otel_api_conformance_recording_possible'
+LANGUAGE C VOLATILE;
+
 CREATE FUNCTION otel_api_conformance_recording(ref bigint)
 RETURNS boolean
 AS 'MODULE_PATHNAME', 'otel_api_conformance_recording'
