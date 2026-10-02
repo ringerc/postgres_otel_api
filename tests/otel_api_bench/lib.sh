@@ -171,6 +171,8 @@ configure_state() {
 	local state=$1
 	local extra_conf="$SCRATCH/state_extra.conf"
 	: >"$extra_conf"
+	# Sampling ratio of a new root in this state, for expected span counts.
+	STATE_SAMPLE_RATIO=
 
 	local null_exporter="shared_preload_libraries = 'otel_api,test_otel_exporter'
 test_otel_exporter.capture = off"
@@ -192,6 +194,7 @@ test_otel_exporter.capture = off"
 		S5) ratio=0.01 ;;
 		S6) ratio=1.0 ;;
 		esac
+		STATE_SAMPLE_RATIO=$ratio
 		echo "$null_exporter" >>"$extra_conf"
 		echo "otel_api.sampler = 'traceidratio'" >>"$extra_conf"
 		echo "otel_api.sampler_arg = $ratio" >>"$extra_conf"
@@ -203,6 +206,7 @@ test_otel_exporter.capture = off"
 		S5o) ratio=0.01 ;;
 		S6o) ratio=1.0 ;;
 		esac
+		STATE_SAMPLE_RATIO=$ratio
 		echo "shared_preload_libraries = 'otel_api,$EXPORTER_LIB'" >>"$extra_conf"
 		echo "otel_api.sampler = 'traceidratio'" >>"$extra_conf"
 		echo "otel_api.sampler_arg = $ratio" >>"$extra_conf"
@@ -419,21 +423,27 @@ wait_for_backends_idle() {
 # on-CPU time of <pid>'s child backend threads, split by thread name
 # (/proc/<backend>/task/*/comm vs. .../schedstat field 1, ns).  Keeps the
 # first and last sample seen per thread id, so a thread that exits mid-cell
-# still contributes its last known value.  Pairs with thread_acct_stop.
+# still contributes its last known value.  That misses up to one interval
+# per thread, including the exporter's flush at backend exit.  Pairs with
+# thread_acct_stop.
+#
+# The poller runs on CLIENT_CPUS, away from the server, and reads /proc
+# with shell builtins: forking per thread per interval would load the CPUs
+# being measured.
 thread_acct_start() {
 	local pmpid=$1
 	THREAD_ACCT_FILE="$SCRATCH/thread_acct.$$"
 	rm -f "$THREAD_ACCT_FILE" "$THREAD_ACCT_FILE.stop"
 	(
+		[ -n "$CLIENT_CPUS" ] && taskset -cp "$CLIENT_CPUS" "$BASHPID" >/dev/null
 		declare -A first last comm
 		while [ ! -f "$THREAD_ACCT_FILE.stop" ]; do
 			for bpid in $(pgrep -P "$pmpid" 2>/dev/null); do
-				for t in /proc/"$bpid"/task/*/; do
-					[ -d "$t" ] || continue
-					tid=$(basename "$t")
-					val=$(awk '{print $1}' "$t/schedstat" 2>/dev/null) || continue
+				for t in /proc/"$bpid"/task/*; do
+					tid=${t##*/}
+					read -r val _ <"$t/schedstat" 2>/dev/null || continue
 					[ -n "$val" ] || continue
-					nm=$(cat "$t/comm" 2>/dev/null) || nm="?"
+					read -r nm <"$t/comm" 2>/dev/null || nm="?"
 					[ -n "${first[$tid]:-}" ] || first[$tid]=$val
 					last[$tid]=$val
 					comm[$tid]=$nm
@@ -497,15 +507,15 @@ PGBENCH_CSV_HEADER="tps,lat_ms,cycles_per_tx,instr_per_tx,exporter_thread_ns_per
 # spawns.  The window is duration + buffer (default 3 s), to let backends
 # exit and fold in their counts.
 #
-# When COLLECTOR_METRICS_URL is set (an exporter state, S5o/S6o), also:
-#  - splits backend on-CPU time into the exporter's tokio worker thread
-#    (pg-otel-demo) vs. everything else (thread_acct_start/stop);
-#  - reads the collector's accepted/refused span counters before and after
-#    the cell (collector_span_counts), after a short wait past backend exit
-#    for the exporter's at-exit batch flush to land;
-#  - if an expected-spans-per-tx figure is given, reports the shortfall
-#    against spans actually accepted.
-# The exporter columns are empty for other states.
+# Also splits backend on-CPU time into the exporter's tokio worker threads
+# (pg-otel-demo) and everything else (thread_acct_start/stop), in every
+# state, so the exporter states can be compared with S6.  In an exporter
+# state (S5o/S6o), also reads the collector's accepted/refused span counters
+# before and after the cell (collector_span_counts), after a short wait past
+# backend exit for the exporter's at-exit flush to land; given the spans per
+# transaction of the workload when sampled, reports the expected count
+# (scaled by the state's sampling ratio) and the shortfall.  The collector
+# columns are empty for other states.
 #
 # Prints: tps,lat_ms,cycles_per_tx,instr_per_tx,exporter_thread_ns_per_tx,
 # other_thread_ns_per_tx,spans_accepted_per_tx,spans_refused_per_tx,
@@ -523,18 +533,18 @@ pgbench_cell() {
 
 	if [ "$exporting" -eq 1 ]; then
 		IFS=, read -r acc_before ref_before <<<"$(collector_span_counts)"
-		thread_acct_start "$pmpid"
 	fi
+	thread_acct_start "$pmpid"
 
 	perf_start "$pmpid" "$((duration + buffer))"
 	out=$(pgbench_run "$script" "$clients" "$duration")
 	[ -n "$PERF_PID" ] && wait_for_backends_idle
 	perf_finish
 
+	thread_acct_stop
+	exp_ns=$THREAD_ACCT_EXP_NS
+	other_ns=$THREAD_ACCT_OTHER_NS
 	if [ "$exporting" -eq 1 ]; then
-		thread_acct_stop
-		exp_ns=$THREAD_ACCT_EXP_NS
-		other_ns=$THREAD_ACCT_OTHER_NS
 		# The exporter flushes its batch at backend exit; give it a moment
 		# to land at the collector before reading counters again.
 		sleep 2
@@ -547,13 +557,13 @@ pgbench_cell() {
 	if [ -n "${ntx:-}" ] && [ "$ntx" -gt 0 ]; then
 		[ -n "$PERF_CYCLES" ] && cpt=$(echo "scale=4; $PERF_CYCLES/$ntx" | bc)
 		[ -n "$PERF_INSTR" ] && ipt=$(echo "scale=4; $PERF_INSTR/$ntx" | bc)
+		ent=$(echo "scale=4; $exp_ns/$ntx" | bc)
+		ont=$(echo "scale=4; $other_ns/$ntx" | bc)
 		if [ "$exporting" -eq 1 ]; then
-			ent=$(echo "scale=4; $exp_ns/$ntx" | bc)
-			ont=$(echo "scale=4; $other_ns/$ntx" | bc)
 			sacc=$(echo "scale=6; ($acc_after - $acc_before)/$ntx" | bc)
 			sref=$(echo "scale=6; ($ref_after - $ref_before)/$ntx" | bc)
 			if [ -n "$expected_spans" ]; then
-				sexp=$expected_spans
+				sexp=$(echo "scale=6; $expected_spans * ${STATE_SAMPLE_RATIO:-1}" | bc)
 				sdrop=$(echo "scale=6; $sexp - $sacc" | bc)
 			fi
 		fi

@@ -38,8 +38,8 @@ CLIENTS=${CLIENTS:-"1 8"}
 
 # Spans per transaction each script's foreign-table access produces when
 # sampled, for the spans-dropped column.  Checked with
-# otel_api.emit_spans_to_log against the real postgres_fdw tracing port
-# (worktrees/postgres-p2-fdw): select_point is one cursor open + one fetch
+# otel_api.emit_spans_to_log against the postgres_fdw tracing port:
+# select_point is one cursor open + one fetch
 # (pg.fdw.cursor, pg.fdw.fetch); select_range and update_point aren't
 # characterised yet, so they're left out (empty spans_expected_per_tx).
 spans_per_tx() {

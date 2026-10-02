@@ -122,36 +122,24 @@ window is counted, including the loopback connections. perf is given a fixed
 window and never signalled, because `perf stat -p` can hang on SIGINT or
 SIGTERM.
 
-For S5o/S6o, `pgbench_cell` also reports (empty for every other state):
+`pgbench_cell` also reports, per transaction:
 
-- `exporter_thread_ns_per_tx`, `other_thread_ns_per_tx`: on-CPU time (ns)
-  per transaction, split between `$EXPORTER_LIB`'s per-backend tokio worker
-  thread (named `pg-otel-demo`) and every other backend thread. Sampled from
-  `/proc/<backend>/task/*/{comm,schedstat}` every ~100ms for the cell's
-  duration, keeping the first and last reading seen per thread id so a
-  thread that exits mid-cell still contributes. `perf stat -p <postmaster>`
-  already includes `pg-otel-demo` threads in its totals; this only splits
-  that total, it doesn't add to it.
-- `spans_accepted_per_tx`, `spans_refused_per_tx`: the collector's
-  `otelcol_receiver_accepted_spans`/`_refused_spans` counters, read before
-  and after the cell and divided by the transaction count. The exporter
-  flushes its batch at backend exit, so the harness waits ~2s past backend
-  exit before the second read. Current otelcol (0.146) exposes these with a
-  `_total` suffix (`otelcol_receiver_accepted_spans_total`); matched with or
-  without it.
-- `spans_expected_per_tx`, `spans_dropped_per_tx`: a hardcoded
-  spans-per-transaction figure per script (`spans_per_tx` in `run-fdw.sh`;
-  only `select_point` is characterised: 2, from `pg.fdw.cursor` +
-  `pg.fdw.fetch`, checked with `otel_api.emit_spans_to_log` against the real
-  `postgres_fdw` port) minus what the collector actually accepted. At low
-  sample rates (S5o) this mostly reflects unsampled transactions, not real
-  exporter-side drops; at 100% (S6o) a nonzero value means the batch
-  processor's queue (`OTEL_BSP_MAX_QUEUE_SIZE`, default 2048) overflowed.
+- `exporter_thread_ns_per_tx`, `other_thread_ns_per_tx`: on-CPU time of the
+  exporter's tokio worker threads (`pg-otel-demo`, one per backend) and of
+  every other backend thread, in every state. Read from
+  `/proc/<backend>/task/*/schedstat` every 100 ms, first and last reading per
+  thread, so up to one interval per thread is missed, including the
+  exporter's flush at backend exit. perf's counts already include the
+  exporter threads; this splits CPU time, it doesn't add to it. Span
+  conversion runs in the backend's main thread, so compare
+  `other_thread_ns_per_tx` with S6.
+- S5o/S6o only: `spans_accepted_per_tx`, `spans_refused_per_tx` from the
+  collector's `otelcol_receiver_{accepted,refused}_spans` counters, read
+  before and after the cell, 2 s after the backends exit.
+  `spans_expected_per_tx` is the workload's spans per sampled transaction
+  times the state's sampling ratio; `spans_dropped_per_tx` is expected minus
+  accepted. At 1% it is noisy. A real shortfall means the exporter's batch
+  queue (`OTEL_BSP_MAX_QUEUE_SIZE`, default 2048) overflowed.
 
-A footgun found while wiring this up: don't capture `thread_acct_stop`'s
-result via `$(thread_acct_stop)` / `<(thread_acct_stop)` while another
-backgrounded job (e.g. `perf_start`'s `perf`) is still outstanding in the
-same shell --- the `wait` inside it, run from the extra subshell a command
-or process substitution forks, can hang indefinitely. `thread_acct_stop`
-sets `THREAD_ACCT_EXP_NS`/`THREAD_ACCT_OTHER_NS` instead; call it as a plain
-statement.
+`thread_acct_stop` sets globals rather than printing: calling it as
+`$(thread_acct_stop)` while perf's background job is outstanding can hang.
