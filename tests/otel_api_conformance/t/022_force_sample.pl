@@ -12,6 +12,15 @@
 #   (c) remote parent, sampled=1 (parent_mode => 'context') -> recorded
 #   (d) unsampled local parent (parent_mode => 'active')  -> NOT recorded
 #
+# (a) and (d) use otel_api.sampler = 'traceidratio' with sampler_arg = 0
+# (a sampler that drops every span but still reaches the per-span
+# sampling decision force_sample overrides for a new root), or
+# 'parentbased_always_off' for (a). Plain otel_api.sampler = 'always_off'
+# is NOT used for either: always_off is a full off switch (otel_api.c's
+# otel_recording_possible), so otel_span_start() takes its inline
+# no-op path before force_sample is even consulted -- force_sample has
+# no effect under it at all. That is covered separately, below, as (e).
+#
 # Test-writing note: each scenario runs inside an explicit
 # BEGIN...COMMIT, same as t/007_unsampled.pl --- a default-owned span
 # started in one top-level ("...;\n") statement is otherwise force-
@@ -39,21 +48,53 @@ my $span_id  = '0011223344556677';
 
 # ----------------------------------------------------------------
 # (a) No parent context: force_sample records the new root even
-# though the sampler hook would otherwise drop it.
+# though the sampler would otherwise drop it.  Checked for both
+# traceidratio/0 and parentbased_always_off -- the two samplers that
+# would otherwise drop a new root without recording it, but are not
+# full off switches.
+# ----------------------------------------------------------------
+for my $sampler (qw(traceidratio parentbased_always_off))
+{
+	my $out = $node->safe_psql('postgres', <<SQL);
+SET otel_api.sampler = '$sampler';
+SET otel_api.sampler_arg = 0;
+BEGIN;
+SELECT otel_api_conformance_start('conformance.force_root',
+	parent_mode => 'root', owner_mode => 'toptxn', force_sample => true) AS s \\gset
+SELECT otel_api_conformance_recording(:s) AS recording;
+SELECT otel_api_conformance_end(:s) AS r1 \\gset
+COMMIT;
+SQL
+	my ($recording) = split /\n/, $out;
+	is($recording, 't',
+		"force_sample records a new root even when the sampler ($sampler) would drop it");
+}
+
+# ----------------------------------------------------------------
+# (e) otel_api.sampler = 'always_off': a full off switch.
+# force_sample has no effect at all -- even a brand-new root is not
+# recorded, because otel_span_start() never reaches the sampler (or
+# force_sample) in the first place.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
 SET otel_api.sampler = 'always_off';
 BEGIN;
-SELECT otel_api_conformance_start('conformance.force_root',
+SELECT otel_api_conformance_start('conformance.force_root_always_off',
 	parent_mode => 'root', owner_mode => 'toptxn', force_sample => true) AS s \gset
+SELECT :s AS s_is_none;
 SELECT otel_api_conformance_recording(:s) AS recording;
 SELECT otel_api_conformance_end(:s) AS r1 \gset
 COMMIT;
+SELECT jsonb_agg(sp) FROM otel_api_conformance_spans() sp WHERE sp->>'name' = 'conformance.force_root_always_off';
 SQL
-	my ($recording) = split /\n/, $out;
-	is($recording, 't',
-		'force_sample records a new root even when the sampler would drop it');
+	my @lines = split /\n/, $out;
+	my ($s_is_none, $recording, $spans_line) = @lines;
+	is($s_is_none, '0',
+		'always_off: force_sample on a new root still returns OTEL_SPAN_NONE');
+	is($recording, 'f', 'always_off: and so is not recording');
+	$spans_line //= '';
+	is($spans_line, '', 'always_off: force_sample exports nothing for a new root');
 }
 
 # ----------------------------------------------------------------
@@ -110,10 +151,15 @@ SQL
 # (d) Unsampled local parent: force_sample on the child must NOT
 # record it, even though the child itself asked to force sampling.
 # Mirrors t/007_unsampled.pl's default-owned-parent transaction shape.
+# Uses traceidratio/0, not always_off: always_off would stop the
+# parent itself from ever being started (OTEL_SPAN_NONE, not a
+# negative nrec handle), so there would be no unsampled local parent
+# for the child to inherit from in the first place.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 BEGIN;
 SELECT otel_api_conformance_start('conformance.local_unsampled_parent') AS parent \gset
 SELECT otel_api_conformance_recording(:parent) AS parent_recording;

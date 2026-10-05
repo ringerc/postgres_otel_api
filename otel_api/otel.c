@@ -244,6 +244,7 @@ static const struct config_enum_entry otel_sampler_options[] = {
 
 
 static void assign_emit_spans_to_log(bool newval, void *extra);
+static void assign_sampler(int newval, void *extra);
 
 /* GUC check / assign hooks. */
 static bool check_traceparent(char **newval, void **extra, GucSource source);
@@ -372,6 +373,19 @@ assign_emit_spans_to_log(bool newval, void *extra)
 }
 
 /*
+ * GUC assign-hook for otel_api.sampler.  Sets otel_sampler_mode from
+ * newval itself (the GUC machinery's own write to *valueAddr happens
+ * only after this hook returns, same as assign_emit_spans_to_log()
+ * above), then recomputes the recording_possible gate.
+ */
+static void
+assign_sampler(int newval, void *extra)
+{
+	otel_sampler_mode = newval;
+	otel_update_recording_possible();
+}
+
+/*
  * SQL function: return the currently-active traceparent in W3C
  * header format, or NULL if none is set.
  */
@@ -492,13 +506,16 @@ _PG_init(void)
 							 "A local parent's own decision is always inherited regardless of this "
 							 "setting.  Raising the sample rate cluster-wide is an operator decision "
 							 "(PGC_SUSET); see otel.trace_all_queries for the per-session opt-in that "
-							 "starts new root traces at all.",
+							 "starts new root traces at all.  always_off disables tracing entirely: "
+							 "no span IDs are generated, force_sample is ignored, and incoming trace "
+							 "context still passes through.  Use traceidratio with sampler_arg = 0 "
+							 "for unsampled spans that are still tracked.  See README \"Sampling\".",
 							 &otel_sampler_mode,
 							 OTEL_SAMPLER_PARENTBASED_ALWAYS_ON,
 							 otel_sampler_options,
 							 PGC_SUSET,
 							 0,
-							 NULL, NULL, NULL);
+							 NULL, assign_sampler, NULL);
 
 	DefineCustomRealVariable("otel_api.sampler_arg",
 							 "Sampling probability for the traceidratio and parentbased_traceidratio samplers.",

@@ -161,6 +161,9 @@ SQL
 # ----------------------------------------------------------------
 # OTEL_SPAN_SET_STR_IF_RECORDING: the expression is evaluated only when
 # recording.  Both start+end for the span happen in one statement.
+# Under always_off (a full off switch) the span itself is
+# OTEL_SPAN_NONE, which still exercises the same not-recording path as
+# a sampler-dropped span.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');

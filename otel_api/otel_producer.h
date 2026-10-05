@@ -326,10 +326,12 @@ otel_producer_api(void)
 
 /*
  * False when no span started now could be recorded: otel_api isn't
- * loaded, or nothing consumes spans (no exporter registered, log emission
- * off).  True doesn't mean a span will be sampled.  Lets a producer skip
- * its own per-call setup in the common untraced case; otel_span_start()
- * already checks it, before building its arguments.
+ * loaded, nothing consumes spans (no exporter registered, log emission
+ * off), or otel_api.sampler is plain always_off.  True doesn't mean a
+ * span will be sampled (e.g. traceidratio with sampler_arg = 0 still
+ * returns true here, and drops the span in the sampler instead).  Lets
+ * a producer skip its own per-call setup in the common untraced case;
+ * otel_span_start() already checks it, before building its arguments.
  */
 static inline bool
 otel_recording_possible(void)

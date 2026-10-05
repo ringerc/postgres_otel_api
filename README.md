@@ -435,6 +435,35 @@ registration — is documented inline in
 emit-hook receives (`OtelSpan`, `OtelSpanContext`, `OtelEvent`,
 attribute storage) lives in [`otel_api/otel.h`](otel_api/otel.h).
 
+## Sampling
+
+`otel_api.sampler` takes the standard `OTEL_TRACES_SAMPLER` names
+(`always_on`, `always_off`, `traceidratio`, and their `parentbased_*`
+variants; `otel_api.sampler_arg` is the ratio for the two
+`traceidratio` samplers). It only decides a brand-new root span or a
+remote parent; a local parent's own decision is always inherited.
+
+Plain `always_off` is a full off switch, not merely "sample nothing":
+with it set, `otel_span_start()` takes its inline no-op path for every
+new root and every remote parent, so no trace or span ID is generated
+and nothing is pushed onto the active span stack.
+`otel.trace_all_queries`'s `force_sample` has no effect under it. This
+is a deliberate deviation from the OTel SDK's `AlwaysOff` sampler,
+which still allocates a span ID for a dropped span — letting a
+downstream service that re-samples the same trace attach to an
+ID nothing upstream ever exported, producing an orphan. A propagated
+incoming context (`traceparent` / `sqlcommenter` / the `M` protocol
+header) still passes through unchanged to anything that reads it,
+such as a FDW forwarding trace context to a remote server.
+
+To get the old "unsampled but still tracked" behaviour — a span that
+takes a non-recording stack slot and establishes parentage for its
+children, but is never exported — use `traceidratio` with
+`otel_api.sampler_arg = 0` instead. To trace only forced roots and
+already-sampled upstream traces, use `parentbased_always_off`, which
+(unlike plain `always_off`) still records a remote-sampled parent, and
+still lets `force_sample` record a new root.
+
 ## Installing (out-of-tree, against an existing PostgreSQL)
 
 <details>

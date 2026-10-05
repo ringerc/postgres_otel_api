@@ -24,8 +24,10 @@
 # see new_trace_id()/OTEL_TRACE_FLAG_RANDOM in otel_producer.c --
 # but not asserted on here).
 #
-# force_sample still recording a new root under otel_api.sampler =
-# always_off is covered by t/022_force_sample.pl, not repeated here.
+# force_sample recording a new root under otel_api.sampler =
+# traceidratio/0 and parentbased_always_off, and NOT doing so under
+# plain always_off (a full off switch), is covered by
+# t/022_force_sample.pl, not repeated here.
 
 use strict;
 use warnings FATAL => 'all';

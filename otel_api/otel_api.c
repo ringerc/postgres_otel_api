@@ -31,16 +31,19 @@ static otel_span_emit_hook_type otel_span_emit_hook = NULL;
 
 /*
  * True when a finished span has somewhere to go: an emit hook, or log
- * emission.  Producers read it inline through the producer table, so
- * "otel_api loaded, nothing consuming spans" costs no call per span.
+ * emission --- and otel_api.sampler isn't always_off, folded in on
+ * purpose as a full off switch.  See README "Sampling".  Producers
+ * read it inline through the producer table, so the untraced case
+ * costs no call per span.
  */
 bool		otel_recording_possible_flag = false;
 
 void
 otel_update_recording_possible(void)
 {
-	otel_recording_possible_flag = otel_span_emit_hook != NULL ||
-		otel_emit_spans_to_log;
+	otel_recording_possible_flag = (otel_span_emit_hook != NULL ||
+									otel_emit_spans_to_log) &&
+		otel_sampler_mode != OTEL_SAMPLER_ALWAYS_OFF;
 }
 
 static void
