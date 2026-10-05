@@ -209,20 +209,25 @@ SQL
 
 # ----------------------------------------------------------------
 # Defect 1d: the unsampled (nrec) variant -- same top-level-abort
-# shape, with otel_api.sampler = 'always_off'.
+# shape, with otel_api.sampler = 'traceidratio' / sampler_arg = 0 (not
+# always_off: always_off returns OTEL_SPAN_NONE rather than a negative
+# nrec handle, so it would not exercise the nrec abort path this
+# scenario is for).
 # ----------------------------------------------------------------
 {
 	my ($ret, $stdout, $stderr) = $node->psql(
 		'postgres', <<'SQL',
 SELECT otel_api_conformance_reset() AS r1 \gset
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.abort.nrec', owner_mode := 'session', detached := true) AS s \gset
 SELECT :s < 0 AS unsampled;
 SELECT otel_api_conformance_activate(:s) AS tok \gset
 SELECT 1/0;
 ROLLBACK;
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 SELECT otel_api_conformance_span_current() AS cur;
 SELECT otel_api_conformance_end(:s);
 SQL

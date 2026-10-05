@@ -1,12 +1,21 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 #
-# Unsampled traces: with otel_api.sampler=always_off, a parent span is
-# unsampled (negative handle, otel_span_recording false); its children
-# are unsampled too, without a fresh sampling decision (PARENT_NREC
-# just inherits); nothing is emitted; otel_span_context_of on the child
-# returns a valid context with sampled=0 and the same trace_id as the
-# parent.  otel_api P2 design, "Conformance test suite" > "Unsampled
-# traces".
+# Unsampled traces: with otel_api.sampler='traceidratio' and
+# otel_api.sampler_arg=0, a parent span is unsampled (negative handle,
+# otel_span_recording false); its children are unsampled too, without
+# a fresh sampling decision (PARENT_NREC just inherits); nothing is
+# emitted; otel_span_context_of on the child returns a valid context
+# with sampled=0 and the same trace_id as the parent.  otel_api P2
+# design, "Conformance test suite" > "Unsampled traces".
+#
+# This is deliberately NOT otel_api.sampler='always_off': always_off
+# is a full off switch (otel_recording_possible() itself goes false),
+# so otel_span_start() takes its inline fast path and never reaches
+# the sampler at all -- there is no non-recording stack entry, no
+# span_id, nothing for otel_span_context_of to return but the
+# incoming/active parent unchanged.  traceidratio with sampler_arg=0
+# reaches the sampler, which drops every span, producing exactly the
+# unsampled-but-tracked (nrec) spans this file exercises.
 #
 # Test-writing note: an unsampled span started with the DEFAULT owner
 # is a non-recording stack entry with no resource owner at all --
@@ -54,7 +63,8 @@ sub flags_unsampled
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 BEGIN;
 SELECT otel_api_conformance_start('conformance.unsampled_parent') AS parent \gset
 SELECT :parent < 0 AS parent_negative;
@@ -97,7 +107,8 @@ SQL
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 BEGIN;
 SELECT otel_api_conformance_start_session('conformance.session_unsampled_parent') AS parent \gset
 SELECT :parent < 0 AS parent_negative;

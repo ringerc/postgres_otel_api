@@ -256,11 +256,15 @@ SQL
 # ----------------------------------------------------------------
 # An unsampled (negative-handle) .detached span can be activated too:
 # its context still propagates to children even though nothing
-# records.
+# records.  Uses traceidratio/0, not always_off: always_off is a full
+# off switch (otel_span_start() returns OTEL_SPAN_NONE, no negative
+# handle at all), whereas traceidratio/0 reaches the sampler and
+# produces the negative, non-recording handle this scenario needs.
 # ----------------------------------------------------------------
 {
 	my $out = $node->safe_psql('postgres', <<'SQL');
-SET otel_api.sampler = 'always_off';
+SET otel_api.sampler = 'traceidratio';
+SET otel_api.sampler_arg = 0;
 BEGIN;
 SELECT otel_api_conformance_start('conformance.activate.unsampled', owner_mode := 'session', detached := true) AS s \gset
 SELECT :s < 0 AS unsampled;
