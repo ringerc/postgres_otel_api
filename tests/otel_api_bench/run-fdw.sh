@@ -99,10 +99,11 @@ for state in $STATES; do
 	for script in $SCRIPTS; do
 		expected=$(spans_per_tx "$script")
 		for clients in $CLIENTS; do
-			# Start every cell from the same table: update_point leaves dead
-			# rows that make later scans cost more, which otherwise shows up
-			# as a difference between states.
-			psql_q -c "VACUUM (FULL, ANALYZE) t_local" -c "CHECKPOINT" >&2
+			# Start every cell from the same table. update_point moves rows
+			# out of id order, so later select_range scans touch more heap
+			# pages. VACUUM FULL keeps the physical order; CLUSTER restores
+			# id order.
+			psql_q -c "CLUSTER t_local USING t_local_pkey" -c "ANALYZE t_local" -c "CHECKPOINT" >&2
 			echo "# $state/$script c=$clients: warm-up" >&2
 			pgbench_run "$SCRIPT_DIR/scripts/$script.sql" "$clients" 5 >&2 || true
 
