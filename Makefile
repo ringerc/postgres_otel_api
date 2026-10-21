@@ -37,7 +37,7 @@ ALL_DIRS  = $(PROD_DIRS) $(TEST_DIRS)
 # tree (see scripts/install-into-contrib.sh).
 USE_PGXS ?= 1
 
-.PHONY: all install install-test-modules install-all check clean
+.PHONY: all install install-test-modules install-all check check-cxx-headers clean
 
 all:
 	@for d in $(ALL_DIRS); do \
@@ -60,6 +60,10 @@ check:
 	@for d in $(ALL_DIRS); do \
 	    $(MAKE) -C $$d USE_PGXS=$(USE_PGXS) check || exit $$?; \
 	done
+
+# Compile every otel_api header as C++ (needs pg_config on PATH or PG_CONFIG=).
+check-cxx-headers:
+	PG_CONFIG="$(or $(PG_CONFIG),pg_config)" tests/cxx_headers/check.sh
 
 clean:
 	@for d in $(ALL_DIRS); do \
