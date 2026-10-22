@@ -43,6 +43,7 @@ tests += {
       't/008_scope.pl',
       't/009_order_independent.pl',
       't/010_cursor_spans.pl',
+      't/011_lock_xid_join.pl',
     ],
   },
 }

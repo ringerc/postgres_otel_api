@@ -426,6 +426,20 @@ sdt_locktag_type_name(int t)
 }
 
 
+/*
+ * Stamp the transaction's top-level xid on its pg.txn span so a waiter's
+ * pg.lock.xid joins to the holder.  Read-only transactions never get an
+ * xid; the attribute is then omitted.
+ */
+static void
+sdt_set_txn_xid(OtelSpanRef span)
+{
+	TransactionId xid = GetTopTransactionIdIfAny();
+
+	if (TransactionIdIsValid(xid))
+		otel_span_set_int(span, OTEL_ATTR_PG_TXN_XID, (int64) xid);
+}
+
 /* -----------------------------------------------------------------------
  * otel_sdt_hook
  *
@@ -493,11 +507,14 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 										   .detached = true);
 				otel_span_set_str(txn_span, OTEL_PG_SPAN_SOURCE,
 								  SDT_SPAN_SOURCE_ATTR_VAL);
+				otel_span_set_int(txn_span, OTEL_ATTR_PG_BACKEND_PID,
+								  MyProcPid);
 			}
 			return;
 		case PG_SDT_TRANSACTION_COMMIT:
 			if (txn_span.v != 0)
 			{
+				sdt_set_txn_xid(txn_span);
 				otel_span_end(txn_span);
 				txn_span = OTEL_SPAN_NONE;
 			}
@@ -523,6 +540,7 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 			{
 				otel_span_set_status(txn_span, OTEL_STATUS_ERROR,
 									 "transaction aborted");
+				sdt_set_txn_xid(txn_span);
 				otel_span_end(txn_span);
 				txn_span = OTEL_SPAN_NONE;
 			}
@@ -785,6 +803,8 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 				int			mode = (int) args[5].v.i;
 				const char *tname = sdt_locktag_type_name(locktag_type);
 
+				otel_span_set_int(s, OTEL_ATTR_PG_BACKEND_PID, MyProcPid);
+
 				if (tname != NULL)
 					otel_span_set_str(s, OTEL_ATTR_PG_LOCK_TYPE, tname);
 				else
@@ -813,6 +833,11 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 
 					case LOCKTAG_TRANSACTION:
 						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_XID, field1);
+						break;
+
+					case LOCKTAG_SPECULATIVE_TOKEN:
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_XID, field1);
+						otel_span_set_int(s, OTEL_ATTR_PG_LOCK_SPECTOKEN, field2);
 						break;
 
 					case LOCKTAG_VIRTUALTRANSACTION:
