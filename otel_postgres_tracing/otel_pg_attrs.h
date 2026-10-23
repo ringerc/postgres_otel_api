@@ -50,6 +50,9 @@
 #define OTEL_ATTR_PG_EXEC_SLOWEST_NODES			"pg.exec.slowest_nodes"
 
 /* Curated child spans (otel_planspans.c) */
+#define OTEL_ATTR_PG_SORT_METHOD			"pg.sort.method"
+#define OTEL_ATTR_PG_SORT_SPACE_TYPE		"pg.sort.space_type"
+#define OTEL_ATTR_PG_SORT_SPACE_KB			"pg.sort.space_kb"
 #define OTEL_ATTR_PG_CUSTOMSCAN_METHOD		"pg.customscan.method"
 
 /* FDW scan spans (otel_fdw.c) */

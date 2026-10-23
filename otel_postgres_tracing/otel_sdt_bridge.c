@@ -366,12 +366,16 @@ otel_sdt_install(void)
 							   "tokens: txn, query, parse, rewrite, plan, execute, "
 							   "sort, smgr_read, smgr_write, smgr, syncrep, "
 							   "replica, lock_wait, plus all and none.  smgr "
-							   "families are high-volume and off by default.  "
+							   "families are high-volume and off by default, as is "
+							   "sort: its span runs from the Sort node's first "
+							   "fetch to executor shutdown, so it is far longer "
+							   "than the sort; use otel.trace_plan_child_spans "
+							   "for accurate sort spans.  "
 							   "This list drives pg_sdt_probe_enabled_mask, which "
 							   "gates the probes at the call site; families not "
 							   "listed never call into this extension.",
 							   &otel_trace_sdt_probes_str,
-							   "query,parse,rewrite,plan,execute,sort,syncrep,replica,lock_wait",
+							   "query,parse,rewrite,plan,execute,syncrep,replica,lock_wait",
 							   PGC_USERSET,
 							   GUC_LIST_INPUT,
 							   sdt_probes_check_hook,

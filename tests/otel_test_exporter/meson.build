@@ -47,6 +47,7 @@ tests += {
       't/012_sdt_probe_guc_midstatement.pl',
       't/013_parallel_worker_attrs.pl',
       't/014_parallel_worker_sdt.pl',
+      't/015_sort_node_span.pl',
     ],
   },
 }

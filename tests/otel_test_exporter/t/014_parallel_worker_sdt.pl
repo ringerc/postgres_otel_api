@@ -38,6 +38,7 @@ $node->safe_psql('postgres', q{
 my $log_start = -s $node->logfile;
 $node->safe_psql('postgres', q{
 	SET otel_api.traceparent = '} . $TRACEPARENT . q{';
+	SET otel.trace_sdt_probes = 'query,execute,sort';
 	SET parallel_setup_cost = 0;
 	SET parallel_tuple_cost = 0;
 	SET min_parallel_table_scan_size = 0;
