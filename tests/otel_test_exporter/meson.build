@@ -44,6 +44,7 @@ tests += {
       't/009_order_independent.pl',
       't/010_cursor_spans.pl',
       't/011_lock_xid_join.pl',
+      't/012_sdt_probe_guc_midstatement.pl',
     ],
   },
 }

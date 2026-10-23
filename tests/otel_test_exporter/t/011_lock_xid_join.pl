@@ -67,11 +67,9 @@ sub txn_xids
 # Start a session with SDT txn+lock_wait spans on and an empty ring.
 sub new_session
 {
-	# Via PGOPTIONS: a mid-session SET otel_api.traceparent leaves a
-	# pg.execute span open, which psql reports as a WARNING.
-	local $ENV{PGOPTIONS} =
-	  "-c otel_api.traceparent=$TRACEPARENT -c otel.trace_sdt_probes=txn,lock_wait";
 	my $s = $node->background_psql('postgres');
+	$s->query_safe("SET otel_api.traceparent = '$TRACEPARENT'");
+	$s->query_safe("SET otel.trace_sdt_probes = 'txn,lock_wait'");
 	$s->query_safe(q{SELECT test_otel_clear()});
 	return $s;
 }
