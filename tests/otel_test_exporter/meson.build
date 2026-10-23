@@ -46,6 +46,7 @@ tests += {
       't/011_lock_xid_join.pl',
       't/012_sdt_probe_guc_midstatement.pl',
       't/013_parallel_worker_attrs.pl',
+      't/014_parallel_worker_sdt.pl',
     ],
   },
 }

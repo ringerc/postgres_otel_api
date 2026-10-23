@@ -73,6 +73,7 @@
 
 #include <string.h>
 
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
@@ -470,10 +471,12 @@ otel_sdt_hook(int id, const PgSdtArg *args, int nargs)
 	 * on.  The per-family in-hook gates below are likewise gone.
 	 */
 
-	/* Only trace client-connected backends — UNLESS this is the replica
-	 * apply probe, which fires in the startup/recovery process where
-	 * MyProcPort is always NULL. */
-	if (MyProcPort == NULL && (PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
+	/* Only trace client-connected backends and their parallel workers
+	 * (which have no MyProcPort) — UNLESS this is the replica apply probe,
+	 * which fires in the startup/recovery process where MyProcPort is
+	 * always NULL. */
+	if (MyProcPort == NULL && !IsParallelWorker() &&
+		(PgSdtProbeId) id != PG_SDT_RECOVERY_XACT_COMMIT)
 		return;
 
 	/* otel_api refuses every call inside a critical section. */
