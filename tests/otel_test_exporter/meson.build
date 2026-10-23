@@ -45,6 +45,7 @@ tests += {
       't/010_cursor_spans.pl',
       't/011_lock_xid_join.pl',
       't/012_sdt_probe_guc_midstatement.pl',
+      't/013_parallel_worker_attrs.pl',
     ],
   },
 }

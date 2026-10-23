@@ -59,6 +59,10 @@
 #define OTEL_ATTR_PG_TXN_XID				"pg.txn.xid"
 #define OTEL_ATTR_PG_BACKEND_PID			"pg.backend.pid"
 
+/* Parallel query execute spans (otel_trace.c) */
+#define OTEL_ATTR_PG_PARALLEL_WORKER_NUMBER	"pg.parallel.worker_number"
+#define OTEL_ATTR_PG_PARALLEL_LEADER		"pg.parallel.leader"
+
 /* Lock-wait bridge span (otel_sdt_bridge.c) */
 #define OTEL_ATTR_PG_LOCK_TYPE			"pg.lock.type"
 #define OTEL_ATTR_PG_LOCK_MODE			"pg.lock.mode"
